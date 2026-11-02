@@ -1,0 +1,1856 @@
+#!/usr/bin/env python3
+"""PreToolUse hook for dynos-work write-policy enforcement.
+
+Reads a JSON payload from stdin, extracts tool_name, tool_input, and cwd,
+resolves the DYNOS_ROLE and DYNOS_TASK_DIR from the environment, then
+calls decide_write() to enforce the write boundary.
+
+Exit codes:
+    0 -- write allowed
+    1 -- internal error (never a silent allow)
+    2 -- write denied (deny-and-continue semantics)
+
+Stderr on denial is prefixed with "write-policy: ".
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+
+# Shared discriminator that rejects the framework home (~/.dynos) and stray
+# orphan .dynos dirs when resolving a project root from an ancestor walk. The
+# `.dynos` name is overloaded (framework home vs. per-project control plane);
+# a bare `.dynos`.is_dir() match would treat $HOME — or any orphan .dynos high
+# in the tree — as a project root and govern unrelated repos. If the shared
+# module cannot be imported, fall back to excluding just the framework home,
+# which is the critical half of the guard.
+try:
+    from lib_dynos_root import is_project_dynos_dir as _is_project_dynos_dir
+except Exception:  # pragma: no cover - defensive import fallback
+    def _is_project_dynos_dir(dynos_dir: Path) -> bool:
+        try:
+            if not dynos_dir.is_dir():
+                return False
+            home = Path(
+                os.environ.get("DYNOS_HOME") or (Path.home() / ".dynos")
+            ).expanduser().resolve()
+            return dynos_dir.resolve() != home
+        except Exception:
+            return False
+
+# Allowlist of valid executor role names that may appear in active-segment-role.
+# Privileged internal roles (ctl, receipt-writer, eventbus, scheduler, system)
+# are intentionally excluded to prevent role-file injection attacks.
+# Commands the planning role may not run: artifact validators, gap analysis,
+# plan audit, and every stage/approval mutation. ``write-execution-graph``
+# and ``write-classification`` stay allowed — the planner persists those
+# payloads through them.
+_PLANNER_BLOCKED_BASH = re.compile(
+    r"validate_task_artifacts|plan_gap_analysis|plan_signature_check|"
+    r"plan_intermediate_state_check|spec_lint|"
+    r"\bctl\s+(?:run-(?!external-solution-gate)[a-z-]+|transition|approve-stage|"
+    r"plan-validated-receipt|plan-audit-receipt|planner-receipt|set-planner-phase|"
+    r"amend-artifact|tdd-receipt)\b"
+)
+
+_EXECUTOR_ROLE_ALLOWLIST: frozenset[str] = frozenset({
+    "backend-executor", "ui-executor", "testing-executor", "integration-executor",
+    "ml-executor", "db-executor", "refactor-executor", "docs-executor",
+    "infra-executor", "security-executor", "data-executor",
+    "observability-executor", "release-executor",
+    "planning", "execute-inline", "repair-coordinator", "investigator",
+    "audit-spec-completion", "audit-security", "audit-code-quality",
+    "audit-performance", "audit-dead-code", "audit-db-schema", "audit-ui", "audit-claude-md",
+    "audit-architecture", "audit-threat-model", "audit-api-contract",
+    "audit-test-strategy", "audit-accessibility", "audit-privacy",
+    "audit-supply-chain", "audit-infrastructure", "audit-observability",
+    "audit-release", "audit-data-integrity", "audit-docs-accuracy",
+})
+
+# Mirrors lib_core.TERMINAL_STAGES without importing lib_core from this hook.
+_TERMINAL_STAGES: frozenset[str] = frozenset({
+    "DONE", "FAILED", "CANCELLED", "CALIBRATED",
+})
+
+def _subagent_isolation(task_dir: "Path | None") -> bool:
+    """True only when the host harness gives each subagent a DISTINCT
+    session_id, making per-subagent write-role enforcement meaningful.
+
+    Default False: Claude Code shares the orchestrator's session_id across
+    all subagents with no distinguishing field (GitHub issue #7881), so a
+    planner/executor/auditor subagent resolves as the orchestrator. With
+    isolation False the orchestrator is permitted to ADOPT the stamped
+    active-segment-role so it can act as that segment's role; otherwise no
+    subagent could ever author its role-scoped artifacts.
+
+    Set ``"subagent_isolation": true`` in
+    ``<project>/.dynos/config/policy.json`` ONLY on a harness that truly
+    isolates subagent sessions — that restores the strict D3 behavior where
+    the orchestrator never adopts a stamped role.
+    """
+    if task_dir is None:
+        return False
+    try:
+        cfg = task_dir.parent.parent / ".dynos" / "config" / "policy.json"
+        if not cfg.is_file():
+            return False
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        return bool(isinstance(data, dict) and data.get("subagent_isolation", False))
+    except Exception:
+        return False
+
+
+def _stamped_roles(task_dir: "Path | None") -> "list[str]":
+    """Valid roles in the role file, oldest first. Parallel spawns each
+    stamp one line, so several subagent roles can be active at once."""
+    if task_dir is None:
+        return []
+    try:
+        rf = task_dir / "active-segment-role"
+        if not rf.is_file():
+            return []
+        roles: list[str] = []
+        for line in rf.read_text(encoding="utf-8").splitlines():
+            val = line.strip()
+            if val and val in _EXECUTOR_ROLE_ALLOWLIST and val not in roles:
+                roles.append(val)
+        return roles
+    except Exception:
+        return []
+
+
+def _adoptable_stamped_roles(task_dir: "Path | None") -> "list[str]":
+    """Return the stamped roles the orchestrator session may adopt: valid,
+    non-orchestrator executor/planning/audit roles, newest last. Lets the
+    orchestrator session act for every running segment under a
+    non-isolating harness (see ``_subagent_isolation``)."""
+    return [r for r in _stamped_roles(task_dir) if r != "orchestrator"]
+
+
+def _decide_for_roles(attempt, roles: "list[str]"):
+    """Decide a write for ``attempt.role``, falling back to the other active
+    roles. Under a shared session the hook cannot tell which running
+    subagent made the call, so the write is allowed when any of their roles
+    allows it; the denial reported is the primary role's."""
+    decision = decide_write(attempt)
+    if decision.allowed:
+        return attempt, decision
+    for other in roles:
+        if other == attempt.role:
+            continue
+        alt = dataclasses.replace(attempt, role=other)
+        alt_decision = decide_write(alt)
+        if alt_decision.allowed:
+            return alt, alt_decision
+    return attempt, decision
+
+
+# ---------------------------------------------------------------------------
+# Module-level imports for write_policy, read_policy, and lib_log.
+# These are resolved lazily at first-use inside main() so the hook can still
+# run when the hooks directory is not yet on sys.path (the path is added at
+# the start of main()). The module-level names are set to None initially and
+# replaced with real objects after the import succeeds. Tests can patch these
+# names to intercept calls.
+# ---------------------------------------------------------------------------
+decide_write = None  # type: ignore[assignment]
+_emit_policy_event = None  # type: ignore[assignment]
+WriteAttempt = None  # type: ignore[assignment]
+decide_read = None  # type: ignore[assignment]
+ReadAttempt_RP = None  # type: ignore[assignment]
+_emit_read_policy_event = None  # type: ignore[assignment]
+log_event = None  # type: ignore[assignment]
+
+
+def _task_is_non_terminal(task_dir: Path) -> bool:
+    try:
+        manifest = json.loads((task_dir / "manifest.json").read_text(encoding="utf-8"))
+        return isinstance(manifest, dict) and manifest.get("stage") not in _TERMINAL_STAGES
+    except Exception:
+        return False
+
+
+def _active_task_from_pointer(dynos: Path) -> Path | None:
+    try:
+        pointer = json.loads((dynos / "active-task.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    task_id = pointer.get("task_id") if isinstance(pointer, dict) else None
+    if not task_id:
+        return None
+    raw_task_dir = pointer.get("task_dir")
+    task_dir = Path(raw_task_dir) if isinstance(raw_task_dir, str) and raw_task_dir else dynos / str(task_id)
+    try:
+        if not task_dir.exists():
+            return None
+        if _task_is_non_terminal(task_dir):
+            return task_dir
+    except Exception:
+        return None
+    return None
+
+
+def _active_tasks_from_manifests(dynos: Path) -> list[Path]:
+    tasks: list[Path] = []
+    try:
+        candidates = sorted(dynos.glob("task-*"), reverse=True)
+        for candidate in candidates:
+            if _task_is_non_terminal(candidate):
+                tasks.append(candidate)
+    except Exception:
+        pass
+    return tasks
+
+
+def _task_dir_from_ancestor_path(cwd: Path) -> Path | None:
+    current = cwd.resolve()
+    for ancestor in [current, *current.parents]:
+        if ancestor.parent.name == ".dynos" and ancestor.name.startswith("task-"):
+            if _task_is_non_terminal(ancestor):
+                return ancestor
+            return None
+    return None
+
+
+def _project_root_from_ancestors(cwd: Path) -> Path | None:
+    current = cwd.resolve()
+    for ancestor in [current, *current.parents]:
+        if _is_project_dynos_dir(ancestor / ".dynos"):
+            return ancestor
+    return None
+
+
+def _task_dir_from_path(path: Path) -> Path | None:
+    try:
+        current = path.resolve()
+    except Exception:
+        return None
+    for ancestor in [current, *current.parents]:
+        if ancestor.parent.name == ".dynos" and ancestor.name.startswith("task-"):
+            if _task_is_non_terminal(ancestor):
+                return ancestor
+            return None
+    return None
+
+
+def _find_task_dir_from_tool_target(tool_name: str, tool_input: object, cwd: Path) -> Path | None:
+    """Infer task context from the actual write target when cwd is unreliable."""
+    raw_paths: list[str] = []
+    if isinstance(tool_input, dict):
+        if tool_name in ("Write", "Edit"):
+            raw = tool_input.get("file_path") or tool_input.get("path")
+            if isinstance(raw, str):
+                raw_paths.append(raw)
+        elif tool_name == "MultiEdit":
+            edits = tool_input.get("edits", [])
+            if isinstance(edits, list):
+                for edit in edits:
+                    if isinstance(edit, dict) and isinstance(edit.get("file_path"), str):
+                        raw_paths.append(edit["file_path"])
+        elif tool_name == "Bash":
+            command = tool_input.get("command", "")
+            if isinstance(command, str):
+                raw_paths.extend(_extract_bash_destinations(command))
+
+    for raw in raw_paths:
+        # An unresolved shell variable is never resolved as a whole, but its
+        # literal prefix (everything before the first `$`, cut back to the
+        # last `/`) can still name the task, e.g.
+        # `.dynos/task-X/audit-reports/$NAME.json`. Infer from that prefix
+        # so main() has the task context it needs to log the
+        # unresolved_shell_variable denial; with no literal directory the
+        # token names nothing and is skipped.
+        if tool_name == "Bash" and "$" in raw:
+            prefix = raw.split("$", 1)[0]
+            if "/" not in prefix:
+                continue
+            raw = prefix.rsplit("/", 1)[0] or "/"
+        try:
+            target = _resolve_path(raw, cwd)
+        except Exception:
+            continue
+        task_dir = _task_dir_from_path(target)
+        if task_dir is not None:
+            return task_dir
+    return None
+
+
+def _find_task_dir_from_ancestors(cwd: Path) -> Path | None:
+    """Walk upward from cwd, returning only an unambiguous active task."""
+    direct_task = _task_dir_from_ancestor_path(cwd)
+    if direct_task is not None:
+        return direct_task
+    current = cwd.resolve()
+    for ancestor in [current, *current.parents]:
+        dynos = ancestor / ".dynos"
+        if _is_project_dynos_dir(dynos):
+            active_tasks = _active_tasks_from_manifests(dynos)
+            pointer_path = dynos / "active-task.json"
+            if pointer_path.exists():
+                try:
+                    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+                else:
+                    if isinstance(pointer, dict) and not pointer.get("task_id"):
+                        return None
+                    task_dir = _active_task_from_pointer(dynos)
+                    if task_dir is not None and len(active_tasks) <= 1:
+                        return task_dir
+                    return None
+            if len(active_tasks) == 1:
+                return active_tasks[0]
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Bash pre-filter: quote-aware write-destination extraction
+# ---------------------------------------------------------------------------
+# The original implementation ran regexes over the raw command string, which
+# matched `>` characters inside quoted prompt text and heredoc bodies and
+# produced false-positive "write destinations" (P0-b in
+# docs/permissions-on-design.md). Extraction is now token-based:
+#   1. heredoc bodies are stripped (their content is data, not shell),
+#   2. the command is tokenized with shlex (quoted strings stay single
+#      tokens and can never be operators),
+#   3. redirection operators and write-verb argv positions are resolved on
+#      the token stream.
+# This filter is defense-in-depth, not the trust anchor: interpreter-internal
+# writes (e.g. `python3 -c "open(p,'w')"`) are invisible to any Bash-level
+# parser. The unforgeable guarantees live in receipts + spawn-log + the
+# ctl-internal require_write_allowed path (see docs/write-boundary-spec.md).
+
+# Legacy regex patterns, retained ONLY as the fallback when shlex cannot
+# tokenize the command (unbalanced quotes). Fallback keeps the filter
+# fail-closed rather than silently allowing unparseable commands.
+_LEGACY_BASH_WRITE_PATTERNS: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r">>?\s*([^\s;|&>]+)"), 1),
+    (re.compile(r"\btee\s+(?:-a\s+)?([^\s;|&]+)"), 1),
+    (re.compile(r"\bmv\s+\S+\s+([^\s;|&]+)"), 1),
+    (re.compile(r"\bcp\s+(?:-[a-zA-Z]+\s+)?(?:\S+\s+)+([^\s;|&]+)"), 1),
+    (re.compile(r"\brsync\s+(?:\S+\s+)+([^\s;|&]+)"), 1),
+    (re.compile(r"\binstall\s+(?:-[a-zA-Z]+\s+(?:\S+\s+)?)?(?:\S+\s+)+([^\s;|&]+)"), 1),
+    (re.compile(r"\brm\s+(?:-[a-zA-Z]+\s+)*([^\s;|&]+)"), 1),
+    (re.compile(r"\bunlink\s+([^\s;|&]+)"), 1),
+]
+
+# Heredoc opener: `<< WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`. The negative
+# lookbehind keeps herestrings (`<<<`) from being misparsed as heredocs.
+_HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<-?\s*(['\"]?)(\w+)\1")
+
+# Punctuation-run tokens that redirect output to a file. `>&` (fd dup) is
+# handled separately — its operand is a file descriptor, not a path.
+_REDIRECT_TOKENS = frozenset({">", ">>", "&>", "&>>", ">|"})
+
+# Device sinks: writing to these persists nothing. The plugin's own skills
+# prescribe `2>/dev/null`; denying a sink only produces noise.
+_SINK_DESTINATIONS = frozenset({
+    "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty",
+})
+
+_COMMAND_SEPARATOR_TOKENS = frozenset({";", "|", "||", "&&", "&", "(", ")"})
+
+# argv-based write verbs -> which following non-flag args are destinations.
+#   "last" -> final non-flag argument (mv/cp/rsync/install)
+#   "all"  -> every non-flag argument (tee/rm/unlink/shred/truncate)
+_WRITE_VERB_DEST: dict[str, str] = {
+    "tee": "all",
+    "mv": "last",
+    "cp": "last",
+    "rsync": "last",
+    "install": "last",
+    "rm": "all",
+    "unlink": "all",
+    "shred": "all",
+    "truncate": "all",
+}
+
+
+def _strip_heredocs(command: str) -> str:
+    """Remove heredoc bodies so their content is not tokenized as shell."""
+    out: list[str] = []
+    terminator: str | None = None
+    for line in command.split("\n"):
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        match = _HEREDOC_OPEN_RE.search(line)
+        out.append(line)
+        if match:
+            terminator = match.group(2)
+    return "\n".join(out)
+
+
+def _heredoc_segments(command: str) -> list[tuple[str, str]]:
+    """Return (opener line, body) for every heredoc in ``command``."""
+    segments: list[tuple[str, str]] = []
+    terminator: str | None = None
+    opener = ""
+    body: list[str] = []
+    for line in command.split("\n"):
+        if terminator is not None:
+            if line.strip() == terminator:
+                segments.append((opener, "\n".join(body)))
+                terminator = None
+                body = []
+            else:
+                body.append(line)
+            continue
+        match = _HEREDOC_OPEN_RE.search(line)
+        if match:
+            terminator = match.group(2)
+            opener = line
+    if terminator is not None and body:
+        segments.append((opener, "\n".join(body)))
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Best-effort interpreter write detection (bug 2, 7.6.0 field report).
+#
+# `python3 -c "open('docs/x.md','w').write(...)"`, a heredoc'd script fed to
+# an interpreter, `node -e "fs.writeFileSync(...)"`, `perl -pi -e ... f` and
+# `sed -i ... f` write files without any shell redirection. We recognise the
+# common literal-path forms so they go through the same decide_write check
+# as `>`; anything computed at run time (a path in a variable, a script
+# file on disk, os.system, a subprocess) is still invisible. This remains
+# ADVISORY — see docs/write-boundary-spec.md "Honest enforcement statement".
+# ---------------------------------------------------------------------------
+
+_INTERPRETER_RE = re.compile(
+    r"^(?:python(?:\d+(?:\.\d+)*)?|pypy3?|node|nodejs|deno|bun|perl|ruby)$"
+)
+_SHELL_INTERPRETERS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+# Flags whose next argument is inline program text, per interpreter family.
+_INLINE_CODE_FLAGS = {
+    "python": {"-c"},
+    "node": {"-e", "--eval", "-p", "--print"},
+    "perl": {"-e", "-E"},
+    "ruby": {"-e"},
+}
+_Q = r"""(['"`])"""  # opening quote of a string literal
+_P = r"""([^'"`\n]+)"""  # the literal path
+# (regex, group index of the path) — each matches a literal-path write.
+_INLINE_WRITE_PATTERNS: list[tuple[re.Pattern[str], int]] = [
+    # Python / Ruby: open('p', 'w'|'a'|'x'|'+'), File.open('p', 'w')
+    (re.compile(
+        r"\bopen\(\s*(?:[rbuf]{1,2})?" + _Q + _P + r"\1\s*,\s*(?:mode\s*=\s*)?"
+        r"(?:[rbuf]{1,2})?(['\"])[^'\"]*[wax+][^'\"]*\3"
+    ), 2),
+    # pathlib: Path('p').write_text/write_bytes/touch/unlink, Path('p').open('w')
+    (re.compile(
+        r"\bPath\(\s*(?:[rbuf]{1,2})?" + _Q + _P + r"\1\s*\)\s*\.\s*"
+        r"(?:write_text|write_bytes|touch|unlink|rename|replace|"
+        r"open\(\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax+])"
+    ), 2),
+    # os.remove/unlink('p'), os.rename/replace(src, 'p'), shutil.copy*(src, 'p')
+    (re.compile(r"\bos\.(?:remove|unlink)\(\s*" + _Q + _P + r"\1"), 2),
+    (re.compile(
+        r"\b(?:os\.(?:rename|replace)|shutil\.(?:copy|copy2|copyfile|copytree|move))"
+        r"\(\s*[^,()]+,\s*" + _Q + _P + r"\1"
+    ), 2),
+    # Node: fs.writeFileSync/appendFileSync/writeFile/appendFile/createWriteStream/
+    # rmSync/unlinkSync/truncateSync('p'); copyFileSync/renameSync/cpSync(src, 'p')
+    (re.compile(
+        r"\b(?:writeFileSync|appendFileSync|writeFile|appendFile|createWriteStream|"
+        r"rmSync|unlinkSync|unlink|truncateSync|outputFileSync)\(\s*" + _Q + _P + r"\1"
+    ), 2),
+    (re.compile(
+        r"\b(?:copyFileSync|copyFile|renameSync|rename|cpSync)\(\s*[^,()]+,\s*"
+        + _Q + _P + r"\1"
+    ), 2),
+    # Deno / Bun
+    (re.compile(r"\b(?:Deno\.writeTextFile(?:Sync)?|Deno\.writeFile(?:Sync)?|Bun\.write)\(\s*" + _Q + _P + r"\1"), 2),
+    # Ruby: File.write / IO.write / File.delete / File.unlink
+    (re.compile(r"\b(?:File|IO)\.(?:write|binwrite|delete|unlink)\(?\s*" + _Q + _P + r"\1"), 2),
+    # Perl: open(FH, '>', 'p') and open(FH, '>p') / open FH, ">>p"
+    (re.compile(
+        r"\bopen\s*\(?\s*[^,()'\"]+,\s*(['\"])\s*(?:\+<|\+?>>?)\s*\1\s*,\s*(['\"])([^'\"\n]+)\2"
+    ), 3),
+    (re.compile(r"\bopen\s*\(?\s*[^,()'\"]+,\s*(['\"])\s*\+?>>?\s*([^'\"\s][^'\"\n]*)\1"), 2),
+]
+
+
+def _scan_inline_code_writes(code: str) -> list[str]:
+    """Literal write paths named in inline interpreter code (best effort)."""
+    found: list[str] = []
+    for pattern, group in _INLINE_WRITE_PATTERNS:
+        for match in pattern.finditer(code):
+            dest = match.group(group).strip()
+            if dest and dest not in found:
+                found.append(dest)
+    return found
+
+
+def _interpreter_family(verb: str) -> str | None:
+    if not _INTERPRETER_RE.match(verb):
+        return None
+    if verb.startswith(("python", "pypy")):
+        return "python"
+    if verb in {"node", "nodejs", "deno", "bun"}:
+        return "node"
+    return verb  # perl / ruby
+
+
+def _in_place_editor_targets(verb: str, args: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """File operands of `sed -i` / `perl -i` / `ruby -i` (best effort).
+
+    ``args`` is the raw argv tail (flags included) up to the next separator.
+    Returns [] when the command does not edit in place.
+    """
+    in_place = False
+    script_given = False
+    # Short flags whose operand is the script / program text.
+    script_flags = {"e", "f"} if verb == "sed" else {"e", "E"}
+    operands: list[tuple[str, int]] = []
+    k = 0
+    while k < len(args):
+        tok, idx = args[k]
+        if tok == "--":
+            operands.extend(args[k + 1:])
+            break
+        if tok.startswith("--"):
+            if tok.startswith("--in-place"):
+                in_place = True
+            elif tok in {"--expression", "--file"}:
+                script_given = True
+                k += 1
+            elif tok.startswith(("--expression=", "--file=")):
+                script_given = True
+            k += 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            cluster = tok[1:]
+            for pos, flag in enumerate(cluster):
+                if flag == "i":
+                    in_place = True
+                    # GNU sed / perl: the rest of the cluster is the backup
+                    # suffix. BSD sed: a following '' operand is the suffix.
+                    if pos == len(cluster) - 1 and verb == "sed" and k + 1 < len(args) \
+                            and args[k + 1][0] == "":
+                        k += 1
+                    break
+                if flag in script_flags:
+                    script_given = True
+                    if pos == len(cluster) - 1:
+                        k += 1  # script/program text is the next token
+                    break
+            k += 1
+            continue
+        operands.append((tok, idx))
+        k += 1
+    if not in_place:
+        return []
+    if not script_given and operands:
+        operands = operands[1:]  # first operand is the script / program file
+    return [(t, i) for t, i in operands if t]
+
+
+def _tokenize_bash(command: str) -> list[str] | None:
+    """shlex-tokenize a command; None when the command cannot be parsed."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _extract_bash_destinations_legacy(command: str) -> list[str]:
+    """Regex fallback used only when shlex tokenization fails."""
+    destinations: list[str] = []
+    seen: set[str] = set()
+    for pattern, group in _LEGACY_BASH_WRITE_PATTERNS:
+        for match in pattern.finditer(command):
+            dest = match.group(group).strip().rstrip(";|&>")
+            if dest and dest not in seen:
+                seen.add(dest)
+                destinations.append(dest)
+    return destinations
+
+
+def _is_candidate_dest(token: str) -> bool:
+    """Filter tokens that cannot be filesystem write destinations."""
+    if not token:
+        return False
+    if token in _SINK_DESTINATIONS:
+        return False
+    if token.isdigit():  # fd numbers from `>& 2` style constructs
+        return False
+    if token.startswith("-"):
+        return False
+    if token in _COMMAND_SEPARATOR_TOKENS or token in _REDIRECT_TOKENS:
+        return False
+    if token in {"<", "<<", "<<<", ">&", "<&"}:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Same-command literal shell assignments (D2).
+#
+# Auditors write `S=.dynos/task-x/audit-reports/a.json; cat > "$S"`. Without
+# substitution the hook resolved the literal token `$S` against cwd and
+# denied with "path escapes task boundary", which the auditor could not act
+# on. We now substitute ONLY assignments whose effect is statically certain
+# from the command text itself; everything else keeps its `$` and is denied
+# fail-closed by main() (reason unresolved_shell_variable). os.environ is
+# never consulted: the hook cannot know the shell's runtime environment.
+#
+# An assignment is "counted" only when it is an unconditional, top-level,
+# assignment-only statement (optionally `export`-prefixed). A name is
+# "poisoned" (never substituted) if it is touched anywhere in the command in
+# any other way — prefix assignment (`S=x cmd`), `+=`, inside a subshell,
+# block, function body or `&&`/`||` branch, `read S`, `for S in`, `unset S`,
+# `${S:=x}`, a mention inside a quoted string (trap/eval bodies), etc. The
+# poison is global (not position-scoped) so a function body or trap that
+# rewrites the name after the last counted assignment cannot slip through.
+# ---------------------------------------------------------------------------
+
+_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+_VAR_REF_RE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+# Statement separator tokens that may PRECEDE a counted assignment. A
+# synthetic ";" is inserted between logical lines.
+_ASSIGN_STATEMENT_START = frozenset({";"})
+# Tokens that may FOLLOW an assignment-only statement. `|` and `&` run the
+# assignment in a subshell, so they are excluded.
+_ASSIGN_STATEMENT_END = frozenset({";", "&&", "||"})
+_BLOCK_OPEN_WORDS = frozenset({"if", "while", "until", "for", "select", "case", "{"})
+_BLOCK_CLOSE_WORDS = frozenset({"fi", "done", "esac", "}"})
+# Builtins that can rewrite variables in ways the token stream cannot see.
+# Any builtin that sets a variable whose NAME it may compute at runtime
+# (declare/typeset/local/readonly with ANSI-C or quoted names, printf -v,
+# read, mapfile/readarray, let, getopts, nameref) can retarget a substituted
+# name after the hook checked it, so its presence disables substitution for
+# the whole command. `builtin`/`command` wrap any of these.
+_SUBSTITUTION_DISABLING_WORDS = frozenset({
+    "eval", "source", ".", "alias",
+    "declare", "typeset", "local", "readonly",
+    "read", "mapfile", "readarray", "let", "getopts",
+    "builtin", "command", "set", "shopt", "unset",
+})
+# Shell syntax that builds names or values the token text cannot show:
+# ANSI-C quoting ($'..'), locale quoting ($".."), indirect expansion (${!x}).
+_SUBSTITUTION_DISABLING_SYNTAX = ("$'", '$"', "${!")
+# Characters that make a substituted value differ from the literal the hook
+# would check: word splitting (whitespace), pathname expansion (glob chars),
+# tilde expansion, command substitution (backtick), quoting residue.
+_UNSAFE_VALUE_CHARS = frozenset(" \t\r\n*?[~`\\'\"")
+_PUNCT_ONLY_RE = re.compile(r"^[();<>|&]+$")
+
+
+def _split_logical_lines(command: str) -> list[str]:
+    """Split on unquoted newlines; join backslash-newline continuations.
+
+    Quote-aware (single, double, backslash) and comment-aware so a quote
+    character inside a `# comment` does not swallow following lines.
+    """
+    lines: list[str] = []
+    buf: list[str] = []
+    in_single = in_double = in_comment = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if in_comment:
+            if ch == "\n":
+                in_comment = False
+                lines.append("".join(buf))
+                buf = []
+            i += 1
+            continue
+        if in_single:
+            buf.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            if command[i + 1] == "\n":
+                i += 2  # line continuation
+                continue
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        if in_double:
+            buf.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "#" and (not buf or buf[-1] in " \t;&|()"):
+            in_comment = True
+            i += 1
+            continue
+        elif ch == "\n":
+            lines.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    lines.append("".join(buf))
+    return lines
+
+
+def _tokenize_bash_statements(stripped: str) -> list[str] | None:
+    """Tokenize line by line, joining logical lines with a synthetic ';'.
+
+    Returns None when any logical line cannot be tokenized (the caller then
+    keeps the whole-command token stream, where newline-separated
+    assignments look like prefix assignments and are poisoned — fail-closed).
+    """
+    tokens: list[str] = []
+    for line in _split_logical_lines(stripped):
+        line_tokens = _tokenize_bash(line)
+        if line_tokens is None:
+            return None
+        if not line_tokens:
+            continue
+        if tokens and tokens[-1] != ";":
+            tokens.append(";")
+        tokens.extend(line_tokens)
+    return tokens
+
+
+def _literal_dollar_names(text: str) -> set[str]:
+    """Names that follow a `$` the shell treats literally ('$S', \\$S).
+
+    posix shlex strips the quoting, so such a token reads `$S` exactly like a
+    real expansion. Poisoning these names (instead of disabling substitution
+    for the whole command) keeps `awk '{print $1}'`, `jq '.x'` or
+    `sed 's/$//'` from blocking an unrelated `S=path; cat > "$S"`, while a
+    literal `'$S'` still leaves every `$S` unsubstituted (fail-closed).
+    """
+    names: set[str] = set()
+    in_single = in_double = False
+    i = 0
+    n = len(text)
+
+    def _name_at(j: int) -> None:
+        m = re.match(r"\{?([A-Za-z_][A-Za-z0-9_]*)", text[j:])
+        if m:
+            names.add(m.group(1))
+
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "$":
+                _name_at(i + 1)
+            elif ch == "'":
+                in_single = False
+        elif ch == "\\":
+            if i + 1 < n and text[i + 1] == "$":
+                _name_at(i + 2)
+            i += 2
+            continue
+        elif ch == '"':
+            in_double = not in_double
+        elif ch == "'" and not in_double:
+            in_single = True
+        i += 1
+    return names
+
+
+# `set` invocations that only toggle shell options (`set -euo pipefail`,
+# `set +x`) never assign a named variable; `set -- a b` (positional
+# parameters) and bare-operand forms keep disabling substitution.
+_SET_OPTION_FLAG_RE = re.compile(r"^[-+][A-Za-z]+$")
+_SET_OPTION_NAME_RE = re.compile(r"^[a-z][a-z-]*$")
+
+
+def _is_option_only_set(tokens: list[str], idx: int) -> bool:
+    """True when the `set` at ``tokens[idx]`` only toggles options."""
+    j = idx + 1
+    saw_flag = False
+    while j < len(tokens) and tokens[j] not in _COMMAND_SEPARATOR_TOKENS \
+            and tokens[j] not in {"&&", "||"}:
+        tok = tokens[j]
+        prev = tokens[j - 1]
+        if _SET_OPTION_FLAG_RE.match(tok):
+            saw_flag = True
+        elif not (
+            saw_flag
+            and _SET_OPTION_FLAG_RE.match(prev)
+            and prev.endswith("o")
+            and _SET_OPTION_NAME_RE.match(tok)
+        ):
+            return False  # `--`, `-`, or a positional operand
+        j += 1
+    return saw_flag
+
+
+def _substitution_disabled(stripped: str, tokens: list[str]) -> bool:
+    """True when the command contains constructs that defeat static analysis."""
+    # IFS changes alter word splitting. (Literal dollars — '$S', \$S — are
+    # handled per name by _literal_dollar_names, not globally.)
+    if "IFS" in stripped:
+        return True
+    if any(marker in stripped for marker in _SUBSTITUTION_DISABLING_SYNTAX):
+        return True
+    paren = 0
+    block = 0
+    for idx, tok in enumerate(tokens):
+        nxt = tokens[idx + 1] if idx + 1 < len(tokens) else ""
+        if tok in _SUBSTITUTION_DISABLING_WORDS:
+            # Option-only `set` and lookup-only `command -v NAME` cannot
+            # assign a variable; every other form stays disabling.
+            if tok == "set" and _is_option_only_set(tokens, idx):
+                pass
+            elif tok == "command" and nxt in {"-v", "-V"}:
+                pass
+            elif tok == "." and idx > 0 and tokens[idx - 1] not in (
+                _COMMAND_SEPARATOR_TOKENS | {"&&", "||", "then", "do", "else", "{"}
+            ):
+                pass  # `jq .`, `find .`, `git add .` — an argument, not `source`
+            else:
+                return True
+        # `printf -v NAME` writes a variable; `export -n`/`-f` and friends
+        # change attributes rather than assigning a literal.
+        if tok == "printf" and "-v" in tokens[idx + 1:]:
+            return True
+        if tok == "export" and nxt.startswith("-"):
+            return True
+        if _PUNCT_ONLY_RE.match(tok):
+            for ch in tok:
+                if ch == "(":
+                    paren += 1
+                elif ch == ")":
+                    paren -= 1
+        elif tok in _BLOCK_OPEN_WORDS:
+            block += 1
+        elif tok in _BLOCK_CLOSE_WORDS:
+            block -= 1
+        if paren < 0 or block < 0:
+            return True
+    return paren != 0 or block != 0
+
+
+def _collect_counted_assignments(tokens: list[str]) -> dict[int, tuple[str, str]]:
+    """Map token index -> (name, raw value) for counted assignments only."""
+    counted: dict[int, tuple[str, str]] = {}
+    paren = 0
+    block = 0
+    n = len(tokens)
+    i = 0
+    while i < n:
+        tok = tokens[i]
+        at_start = i == 0 or tokens[i - 1] in _ASSIGN_STATEMENT_START
+        if at_start and paren == 0 and block == 0:
+            j = i
+            if tok == "export":
+                j += 1
+            k = j
+            while k < n and _ASSIGNMENT_RE.match(tokens[k]):
+                k += 1
+            ends_cleanly = k == n or tokens[k] in _ASSIGN_STATEMENT_END
+            if k > j and ends_cleanly:
+                for idx in range(j, k):
+                    m = _ASSIGNMENT_RE.match(tokens[idx])
+                    assert m is not None
+                    counted[idx] = (m.group(1), m.group(2))
+                i = k
+                continue
+        if _PUNCT_ONLY_RE.match(tok):
+            for ch in tok:
+                if ch == "(":
+                    paren += 1
+                elif ch == ")":
+                    paren -= 1
+        elif tok in _BLOCK_OPEN_WORDS:
+            block += 1
+        elif tok in _BLOCK_CLOSE_WORDS:
+            block -= 1
+        i += 1
+    return counted
+
+
+def _mentions_name(text: str, name: str) -> bool:
+    """True if `name` appears in `text` other than as a plain `$name`/`${name}` read."""
+    esc = re.escape(name)
+    # A name right after `/` is a path component (`/var/folders/.../T/x`, the
+    # macOS temp dir) and cannot assign or rewrite the variable.
+    if re.search(r"(?<![A-Za-z0-9_$/])(?<!\$\{)" + esc + r"(?![A-Za-z0-9_])", text):
+        return True  # bare word: read S, for S in, unset S, S+=x, trap bodies
+    if re.search(r"\$\{" + esc + r"(?!\})", text):
+        return True  # ${S:=x}, ${S=x}, ${S/a/b} ...
+    return re.search(r"\$\{[#!]" + esc + r"(?![A-Za-z0-9_])", text) is not None
+
+
+def _substitute_refs(text: str, env: dict[str, "str | None"]) -> str:
+    """Single-pass substitution of $NAME / ${NAME}; replacements are not rescanned."""
+
+    def _repl(m: "re.Match[str]") -> str:
+        name = m.group(1) or m.group(2)
+        value = env.get(name)
+        if value is None:
+            return m.group(0)
+        return value
+
+    return _VAR_REF_RE.sub(_repl, text)
+
+
+def _build_assignment_resolver(stripped: str, tokens: list[str]):
+    """Return f(token, index) -> substituted token, or None when disabled."""
+    if "$" not in stripped or _substitution_disabled(stripped, tokens):
+        return None
+    counted = _collect_counted_assignments(tokens)
+    if not counted:
+        return None
+    names = {name for name, _ in counted.values()}
+    # A name written after a literal `$` ('$S', \$S) reads like an
+    # expansion once shlex strips the quotes; never substitute it.
+    poisoned: set[str] = names & _literal_dollar_names(stripped)
+    for idx, tok in enumerate(tokens):
+        text = counted[idx][1] if idx in counted else tok
+        for name in names:
+            if name not in poisoned and _mentions_name(text, name):
+                poisoned.add(name)
+
+    # Timeline of (index, name, resolved value | None). Values are
+    # substituted exactly once from the env in effect at the assignment.
+    timeline: list[tuple[int, str, "str | None"]] = []
+    env: dict[str, "str | None"] = {}
+    for idx in sorted(counted):
+        name, raw_value = counted[idx]
+        if name in poisoned:
+            continue
+        value = _substitute_refs(raw_value, env)
+        if not value or any(c in _UNSAFE_VALUE_CHARS for c in value):
+            resolved: "str | None" = None  # leave $NAME in place -> denied
+        else:
+            resolved = value
+        env[name] = resolved
+        timeline.append((idx, name, resolved))
+
+    def _resolve(token: str, index: int) -> str:
+        if "$" not in token:
+            return token
+        local: dict[str, "str | None"] = {}
+        for idx, name, value in timeline:
+            if idx >= index:
+                break
+            local[name] = value  # last assignment before the destination wins
+        return _substitute_refs(token, local)
+
+    return _resolve
+
+
+def _extract_bash_destinations(command: str) -> list[str]:
+    """Return write destination paths detected in a Bash command string.
+
+    Token-based: quoted strings are single tokens (never operators), heredoc
+    bodies are stripped before tokenization. Falls back to the legacy regex
+    scan when the command cannot be tokenized.
+
+    Same-command literal assignments (`S=path; cat > "$S"`, optionally
+    `export`-prefixed) are substituted into destinations; see the D2 block
+    above for exactly which assignments count. A destination that still
+    contains `$` is returned as-is and denied by main(). os.environ is never
+    consulted.
+    """
+    stripped = _strip_heredocs(command)
+    tokens = _tokenize_bash(stripped)
+    if tokens is None:
+        return _extract_bash_destinations_legacy(command)
+    statement_tokens = _tokenize_bash_statements(stripped)
+    if statement_tokens is not None:
+        tokens = statement_tokens
+    resolver = _build_assignment_resolver(stripped, tokens)
+
+    destinations: list[str] = []
+    seen: set[str] = set()
+
+    def _add(dest: str, index: int) -> None:
+        if resolver is not None:
+            dest = resolver(dest, index)
+        if _is_candidate_dest(dest) and dest not in seen:
+            seen.add(dest)
+            destinations.append(dest)
+
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        # Redirection operator: next token is the destination. Punctuation
+        # runs may glue a trailing newline onto the operator; normalize.
+        # Strip backticks so tokens like `` `cp `` resolve correctly as verbs.
+        op = tok.strip().strip("`")
+        if op in _REDIRECT_TOKENS:
+            if i + 1 < n:
+                _add(tokens[i + 1].strip("`"), i + 1)
+                i += 2
+                continue
+        # Write verb: collect its argv tail up to the next separator. The
+        # verb is recognized at any statement position (parity with the old
+        # \b-anchored regexes) — quoted text can no longer false-positive
+        # because it arrives as a single token, not as words.
+        verb = os.path.basename(op)
+        if verb in _WRITE_VERB_DEST:
+            mode = _WRITE_VERB_DEST[verb]
+            args: list[tuple[str, int]] = []
+            j = i + 1
+            while j < n and tokens[j] not in _COMMAND_SEPARATOR_TOKENS:
+                t = tokens[j].strip("`")
+                if t in _REDIRECT_TOKENS:
+                    break
+                if t != "--" and not t.startswith("-"):
+                    args.append((t, j))
+                j += 1
+            if mode == "all":
+                for a, ai in args:
+                    _add(a, ai)
+            elif args:
+                # "last" verbs need >= 2 operands to have a distinct
+                # destination (`mv src dst`); a single operand is a source.
+                if verb in {"mv", "cp", "rsync", "install"}:
+                    if len(args) >= 2:
+                        _add(*args[-1])
+                else:
+                    _add(*args[-1])
+            i = j
+            continue
+        # Best-effort interpreter / in-place-editor writes (bug 2).
+        family = _interpreter_family(verb)
+        if family is not None or verb in {"sed", "dd"}:
+            tail: list[tuple[str, int]] = []
+            j = i + 1
+            while j < n and tokens[j] not in _COMMAND_SEPARATOR_TOKENS:
+                t = tokens[j].strip("`")
+                if t in _REDIRECT_TOKENS:
+                    break
+                tail.append((t, j))
+                j += 1
+            if verb == "dd":
+                for t, ti in tail:
+                    if t.startswith("of="):
+                        _add(t[3:], ti)
+            else:
+                if verb in {"sed", "perl", "ruby"}:
+                    for t, ti in _in_place_editor_targets(verb, tail):
+                        _add(t, ti)
+                code_flags = _INLINE_CODE_FLAGS.get(family or "", set())
+                for k, (t, ti) in enumerate(tail):
+                    if t in code_flags and k + 1 < len(tail):
+                        code, ci = tail[k + 1]
+                        for dest in _scan_inline_code_writes(code):
+                            _add(dest, ci)
+            i = j
+            continue
+        i += 1
+
+    # Heredoc bodies were stripped before tokenizing; a body fed to an
+    # interpreter (`python3 - <<'PY'`) or a shell (`bash <<EOF`) is code.
+    # `$` in a body path is never substituted (quoted vs unquoted heredoc
+    # expansion differs), so it stays unresolved and is denied fail-closed.
+    for opener, body in _heredoc_segments(command):
+        opener_tokens = _tokenize_bash(_HEREDOC_OPEN_RE.sub(" ", opener)) or opener.split()
+        verbs = {os.path.basename(t.strip("`")) for t in opener_tokens}
+        if any(_interpreter_family(v) for v in verbs):
+            body_dests = _scan_inline_code_writes(body)
+        elif verbs & _SHELL_INTERPRETERS:
+            body_dests = _extract_bash_destinations(body)
+        else:
+            continue
+        for dest in body_dests:
+            if _is_candidate_dest(dest) and dest not in seen:
+                seen.add(dest)
+                destinations.append(dest)
+    return destinations
+
+
+def _resolve_path(raw: str, cwd: Path) -> Path:
+    """Resolve a path string relative to cwd."""
+    p = Path(raw)
+    if not p.is_absolute():
+        p = cwd / p
+    return p.resolve()
+
+
+def _extract_read_target(
+    tool_name: str, tool_input: object, cwd: Path
+) -> tuple[Path | None, str | None, str | None]:
+    """Return ``(target, raw_pattern, error)`` for a Read/Grep/Glob call.
+
+    Shared by the planning and audit read-policy branches so both resolve
+    the tool target identically. ``error`` is a message for exit code 1
+    (malformed tool_input), never a policy decision.
+    """
+    if not isinstance(tool_input, dict):
+        return None, None, f"{tool_name} tool_input is not a dict"
+    if tool_name == "Read":
+        raw_path = tool_input.get("file_path") or tool_input.get("path") or ""
+        if not raw_path:
+            return None, None, "Read has no file_path in tool_input"
+        return _resolve_path(raw_path, cwd), None, None
+    if tool_name == "Grep":
+        # CRITICAL: Grep target is `path` (search root), NOT `pattern` (regex).
+        raw_path = tool_input.get("path", "")
+        if not raw_path:
+            # No explicit search root: fall back to cwd. This still allows
+            # decide_read to apply the diff/task_dir allowlist on cwd.
+            raw_path = str(cwd)
+        return _resolve_path(raw_path, cwd), None, None
+    pattern = tool_input.get("pattern", "")
+    if not pattern:
+        return None, None, "Glob has no pattern in tool_input"
+    # Best-effort: resolve pattern as a path so prefix checks see an
+    # absolute string. The original pattern is preserved in raw_pattern.
+    return _resolve_path(pattern, cwd), pattern, None
+
+
+def _format_denial(role: str, path: Path | str, decision) -> str:
+    """Self-explaining denial text (P0-f in docs/permissions-on-design.md).
+
+    Denials from this hook are routinely mistaken for Claude Code permission
+    failures, sending users into settings changes that cannot help. Every
+    denial therefore names (a) what it is, (b) the role and path it judged,
+    and (c) the sanctioned alternative when one exists.
+    """
+    sanctioned = ""
+    wrapper = getattr(decision, "wrapper_command", None)
+    if wrapper:
+        sanctioned = f" Sanctioned path: {wrapper}."
+    return (
+        f"write-policy: DENIED — {decision.reason} "
+        f"[dynos-work guardrail, not a Claude Code permission; changing "
+        f"permission settings will not affect this] "
+        f"role={role} path={path}.{sanctioned} "
+        f"Temp files belong in .dynos/task-*/_scratch/. "
+        f"See docs/write-boundary-spec.md."
+    )
+
+
+def main() -> int:
+    """Main entry point. Returns exit code."""
+    global decide_write, _emit_policy_event, WriteAttempt, decide_read, ReadAttempt_RP, _emit_read_policy_event, log_event
+
+    # Add hooks directory to sys.path so we can import write_policy, read_policy, and lib_log
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+
+    # Parse stdin JSON -- any failure here is an internal error (exit 1)
+    try:
+        raw_stdin = sys.stdin.read()
+        payload = json.loads(raw_stdin)
+    except json.JSONDecodeError as exc:
+        print(f"pre-tool-use: malformed stdin (not valid JSON): {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"pre-tool-use: failed to read stdin: {exc}", file=sys.stderr)
+        return 1
+
+    # Extract required fields -- missing fields are an internal error (exit 1)
+    try:
+        tool_name = payload["tool_name"]
+        tool_input = payload["tool_input"]
+        cwd_str = payload.get("cwd", os.getcwd())
+        cwd = Path(cwd_str).resolve()
+    except KeyError as exc:
+        print(f"pre-tool-use: missing required field in payload: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"pre-tool-use: failed to parse payload fields: {exc}", file=sys.stderr)
+        return 1
+
+    # Import write_policy -- failure is an internal error (exit 1)
+    # decide_write may be pre-populated by tests via module-level patching;
+    # WriteAttempt and _emit_policy_event are always resolved from write_policy
+    # because they are not independently patchable by the test suite.
+    try:
+        import write_policy as _wp
+        if decide_write is None:
+            decide_write = _wp.decide_write
+        if _emit_policy_event is None:
+            _emit_policy_event = _wp._emit_policy_event
+        if WriteAttempt is None:
+            WriteAttempt = _wp.WriteAttempt
+    except ImportError as exc:
+        # Only fatal if decide_write itself is not yet available
+        if decide_write is None:
+            print(f"pre-tool-use: cannot import write_policy: {exc}", file=sys.stderr)
+            return 1
+        # If decide_write was pre-populated (test context), proceed without
+        # write_policy — WriteAttempt and _emit_policy_event may be None
+
+    # Import read_policy -- failure is non-fatal if decide_read was pre-populated
+    try:
+        import read_policy as _rp
+        if decide_read is None:
+            decide_read = _rp.decide_read
+        if ReadAttempt_RP is None:
+            ReadAttempt_RP = _rp.ReadAttempt
+        if _emit_read_policy_event is None:
+            _emit_read_policy_event = _rp._emit_read_policy_event
+    except ImportError as exc:
+        # Only fatal if decide_read itself is not yet available
+        if decide_read is None:
+            print(f"pre-tool-use: cannot import read_policy: {exc}", file=sys.stderr)
+            return 1
+
+    # Import lib_log -- failure is non-fatal (event logging is optional)
+    if log_event is None:
+        try:
+            import lib_log as _ll
+            log_event = _ll.log_event
+        except ImportError:
+            pass
+
+    # Actor identity inputs (D3): the harness-provided session_id and the
+    # SessionStart-pinned orchestrator identity. Neither is agent-writable.
+    session_id = str(payload.get("session_id") or "").strip()
+
+    # Resolve role from environment
+    role_from_env = os.environ.get("DYNOS_ROLE", "").strip()
+
+    # Resolve task_dir from explicit task context first, then from the
+    # hook-owned session binding, and only then from unambiguous ancestors.
+    # The old project-global active-task pointer is deliberately not trusted
+    # when multiple active tasks exist.
+    task_dir_from_env = os.environ.get("DYNOS_TASK_DIR", "").strip()
+    project_root = _project_root_from_ancestors(cwd)
+    if task_dir_from_env:
+        env_task_dir = Path(task_dir_from_env).resolve()
+        if _task_is_non_terminal(env_task_dir):
+            task_dir: Path | None = env_task_dir
+            project_root = task_dir.parent.parent
+        else:
+            task_dir = None
+    else:
+        task_dir = None
+        target_task_dir = _find_task_dir_from_tool_target(tool_name, tool_input, cwd)
+        if target_task_dir is not None:
+            task_dir = target_task_dir
+            project_root = task_dir.parent.parent
+        if task_dir is None and project_root is not None and session_id:
+            try:
+                import actor_identity as _ai_task
+                bound_task = _ai_task.lookup_session_task(project_root, session_id)
+                if bound_task is not None:
+                    task_dir = bound_task
+            except Exception:
+                pass
+        if task_dir is None:
+            task_dir = _find_task_dir_from_ancestors(cwd)
+            if task_dir is not None:
+                project_root = task_dir.parent.parent
+
+    if task_dir is not None and session_id:
+        try:
+            import actor_identity as _ai_bind
+            _ai_bind.bind_session_task(task_dir.parent.parent, session_id, task_dir)
+        except Exception:
+            pass
+
+    actor_identity = None
+    pin = None
+    latest_pin = None
+    if task_dir is not None:
+        try:
+            import actor_identity as _ai
+            actor_identity = _ai
+            pin = _ai.read_pin(task_dir.parent.parent, session_id=session_id)
+            latest_pin = _ai.read_pin(task_dir.parent.parent)
+        except Exception:
+            actor_identity = None
+            pin = None
+            latest_pin = None
+
+    # Role resolution chain:
+    # (a) DYNOS_ROLE env var — highest priority (daemon/scheduler/tests)
+    # (b) orchestrator pin — session_id matches the SessionStart pin: the
+    #     MAIN session always resolves to 'orchestrator' and never reads
+    #     role files (stamping a subagent role can no longer mutate the
+    #     orchestrator's own rights mid-flow)
+    # (c) session binding / grant consumption — any OTHER session is a
+    #     subagent: reuse its existing binding, else consume the oldest
+    #     pending grant from the ctl-written ledger
+    # (d) legacy role file — sessions without a pin (pre-D3 sessions) and
+    #     subagents on tasks that still stamp active-segment-role
+    # (e) default "execute-inline"
+    role_file_searched: bool = False
+    # Every role active for this call; more than one only when parallel
+    # segments share the role file. Writes are checked against all of them.
+    candidate_roles: list[str] = []
+    role_file_path: Path | None = None
+    role_file_reason: str | None = None  # "absent" | "empty" | "invalid"
+
+    if role_from_env:
+        # Step (a): env var wins
+        role = role_from_env
+        role_missing = False
+    else:
+        role: str | None = None
+        role_missing = True
+
+        # Steps (b)/(c): only meaningful when both a task dir and a pin
+        # exist — without a pin we cannot distinguish actors and fall back
+        # to the legacy chain wholesale (today's behavior, no regression).
+        if task_dir is not None and actor_identity is not None and latest_pin and session_id:
+            if pin is not None and session_id == pin.get("session_id"):
+                # Orchestrator session. Strict D3 (subagent_isolation=true):
+                # never adopt a stamped role — prevents self-escalation.
+                # Under a non-isolating harness like Claude Code (default),
+                # subagents share this session_id with no distinguisher
+                # (issue #7881), so the orchestrator MUST adopt the stamped
+                # active-segment-role to act as the planner/executor/auditor
+                # for the segment, else no subagent can author its
+                # role-scoped artifacts. Forgery defenses are unaffected:
+                # control-plane.json and the pin are denied to ALL roles,
+                # and audit-report writes remain cross-checked against
+                # spawn-log.jsonl at receipt time.
+                adoptable = (
+                    [] if _subagent_isolation(task_dir)
+                    else _adoptable_stamped_roles(task_dir)
+                )
+                adopted = adoptable[-1] if adoptable else None
+                if adopted is not None:
+                    role = adopted
+                    candidate_roles = adoptable
+                    role_missing = False
+                    try:
+                        if log_event is not None:
+                            log_event(
+                                task_dir.parent.parent,
+                                "orchestrator_role_adopted",
+                                task=task_dir.name,
+                                role=adopted,
+                            )
+                    except Exception:
+                        pass
+                else:
+                    role = "orchestrator"
+                    role_missing = False
+            else:
+                bound = actor_identity.lookup_binding(task_dir, session_id)
+                if bound is None:
+                    bound = actor_identity.consume_grant(task_dir, session_id)
+                    if bound is not None:
+                        try:
+                            if log_event is not None:
+                                log_event(
+                                    task_dir.parent.parent,
+                                    "role_grant_consumed",
+                                    task=task_dir.name,
+                                    role=bound,
+                                    session=session_id[:16],
+                                )
+                        except Exception:
+                            pass
+                if bound is not None and bound in _EXECUTOR_ROLE_ALLOWLIST:
+                    role = bound
+                    role_missing = False
+
+        # Step (d): legacy role file fallback.
+        if role is None:
+            role = "execute-inline"
+            if task_dir is not None:
+                role_file_path = task_dir / "active-segment-role"
+                role_file_searched = True
+                try:
+                    if role_file_path.is_file():
+                        file_contents = role_file_path.read_text(encoding="utf-8").strip()
+                        file_roles = _stamped_roles(task_dir)
+                        if file_roles:
+                            role = file_roles[-1]
+                            candidate_roles = file_roles
+                            role_missing = False
+                        elif file_contents and file_contents not in _EXECUTOR_ROLE_ALLOWLIST:
+                            # Not an allowed executor role — reject and fall to
+                            # (e) to prevent privilege escalation via role file.
+                            role_file_reason = "invalid"
+                        else:
+                            role_file_reason = "empty"
+                    else:
+                        role_file_reason = "absent"
+                except Exception:
+                    role_file_reason = "absent"
+
+    # Degraded-mode diagnostic (D3): if the ORCHESTRATOR role is denied while
+    # grants are pending, the denial may actually be a subagent whose tool
+    # calls arrived under the pinned session_id (harness did not distinguish
+    # actors). Fail closed, but say so — this is the one failure mode of
+    # session-keyed actor resolution and it must be diagnosable from the
+    # error text alone.
+    degraded_hint = ""
+    if role == "orchestrator" and actor_identity is not None and task_dir is not None:
+        try:
+            if actor_identity.pending_grants(task_dir):
+                degraded_hint = (
+                    " NOTE: unconsumed role grants are pending for this task. "
+                    "If this denial occurred inside a SUBAGENT, the harness "
+                    "did not present a distinct session_id for it (degraded "
+                    "actor resolution) — see docs/permissions-on-design.md §D3."
+                )
+        except Exception:
+            pass
+
+    # Emit pre_tool_use_role_missing event if role was not set in the environment
+    # AND role was not resolved from the role file (step b)
+    if role_missing:
+        if tool_name == "Bash":
+            raw_cmd = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+            missing_event_path = str(raw_cmd)[:120]
+        else:
+            if isinstance(tool_input, dict):
+                missing_event_path = tool_input.get("file_path", tool_input.get("path", ""))
+            else:
+                missing_event_path = ""
+        try:
+            if log_event is not None and task_dir is not None:
+                root = task_dir.parent.parent
+                log_event(
+                    root,
+                    "pre_tool_use_role_missing",
+                    task=task_dir.name,
+                    tool_name=tool_name,
+                    resolved_path=str(missing_event_path),
+                    fallback_role=role,
+                )
+        except Exception:
+            # Event logging failure is NOT a fatal internal error -- proceed
+            pass
+
+    # Emit pre_tool_use_role_file_missing when resolution landed on (c) and
+    # a role file was searched at (b) but was absent or empty
+    if role_missing and role_file_searched and role_file_reason is not None and task_dir is not None:
+        try:
+            if log_event is not None:
+                log_event(
+                    task_dir.parent.parent,
+                    "pre_tool_use_role_file_missing",
+                    task_dir=str(task_dir),
+                    path=str(role_file_path),
+                    reason=role_file_reason,
+                )
+        except Exception:
+            # Event logging failure is NOT a fatal internal error -- proceed
+            pass
+
+    # -----------------------------------------------------------------
+    # Handle Bash tool: apply regex pre-filter on command
+    # -----------------------------------------------------------------
+    if tool_name == "Bash":
+        command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+        if not isinstance(command, str):
+            print("pre-tool-use: Bash tool_input.command is not a string", file=sys.stderr)
+            return 1
+
+        # Role authorization probe: verify the resolved role is recognized before
+        # any side effects occur. Check directly against _EXECUTOR_ROLE_ALLOWLIST
+        # rather than calling decide_write(path=cwd) — passing the repo root
+        # through decide_write always produces "path escapes task boundary" for
+        # non-executor roles (planning, audit-*, repair-coordinator), blocking
+        # every Bash command including required ctl wrapper calls. The allowlist
+        # is the authoritative set of valid agent roles; anything else is a
+        # mis-configured or injected role and should be denied unconditionally.
+        if task_dir is not None:
+            if (
+                role != "orchestrator"
+                and role not in _EXECUTOR_ROLE_ALLOWLIST
+                and not role.endswith("-executor")
+            ):
+                print(
+                    f"write-policy: role '{role}' is not in the authorized role "
+                    f"allowlist [dynos-work guardrail, not a Claude Code "
+                    f"permission]. Stamp a valid role via "
+                    f"`ctl.py stamp-role <task_dir> --role <role>`; valid roles: "
+                    f"{', '.join(sorted(_EXECUTOR_ROLE_ALLOWLIST))}",
+                    file=sys.stderr,
+                )
+                return 2
+
+        # Planning role: validation and stage control belong to the
+        # orchestrator. One observed plan phase spent ~27 minutes running
+        # its own validator dry-runs and merge scripts in _scratch before
+        # returning; every such call is a wasted model turn, and the
+        # orchestrator re-runs the same checks anyway.
+        if role == "planning" and task_dir is not None:
+            blocked = _PLANNER_BLOCKED_BASH.search(command)
+            if blocked:
+                try:
+                    if log_event is not None:
+                        log_event(
+                            task_dir.parent.parent,
+                            "planner_bash_denied",
+                            task=task_dir.name,
+                            command=command[:120],
+                            matched=blocked.group(0),
+                        )
+                except Exception:
+                    pass
+                print(
+                    "write-policy: the planner does not run validators, gap analysis, "
+                    "or stage commands — return the artifacts and the orchestrator "
+                    f"validates them (matched {blocked.group(0)!r}) [dynos-work guardrail]",
+                    file=sys.stderr,
+                )
+                return 2
+
+        destinations = _extract_bash_destinations(command)
+
+        # D2 fail-closed: a destination that still contains `$` after
+        # same-command literal substitution (unassigned/poisoned variable,
+        # `$(...)`, or the legacy-regex fallback) cannot be verified — the
+        # hook never expands from os.environ. Deny BEFORE _resolve_path so
+        # the token is never misjudged as "path escapes task boundary".
+        for raw_dest in destinations:
+            # Scoped to task context, like the role and planner checks above:
+            # outside a dynos task the hook has no boundary to protect and a
+            # literal path is allowed anyway, so `$HOME`/`$TMPDIR`/`$(mktemp)`
+            # destinations keep the pre-D2 pass-through behaviour.
+            if "$" not in raw_dest or task_dir is None:
+                continue
+            from write_policy import CANONICAL_AUDIT_REPORT_PATH
+            try:
+                if log_event is not None:
+                    log_event(
+                        task_dir.parent.parent,
+                        "pre_tool_use_bash_check",
+                        task=task_dir.name,
+                        command=command[:120],
+                        destination=raw_dest,
+                        role=role,
+                        allowed=False,
+                        reason="unresolved_shell_variable",
+                    )
+            except Exception:
+                pass
+            print(
+                f"write-policy: DENIED — unresolved_shell_variable: Bash write "
+                f"destination {raw_dest!r} still contains '$' after "
+                f"substituting same-command literal assignments; the hook "
+                f"never expands variables from the environment, so it cannot "
+                f"verify where this write lands [dynos-work guardrail, not a "
+                f"Claude Code permission; changing permission settings will "
+                f"not affect this] role={role}. Write to a literal path "
+                f"(or assign it literally in the same command, e.g. "
+                f"T=.dynos/task-<id>; cat > \"$T/_scratch/out\"). A "
+                f"variable set by an EARLIER Bash call is not visible to "
+                f"this check (shell state is not carried between calls), "
+                f"and `$(...)`, conditional, subshell or prefix assignments "
+                f"are never substituted. Auditors write reports to "
+                f"{CANONICAL_AUDIT_REPORT_PATH}. "
+                f"See docs/write-boundary-spec.md." + degraded_hint,
+                file=sys.stderr,
+            )
+            return 2
+
+        # Substring-scan defense for control-plane filenames against deletion
+        # primitives that bypass _extract_bash_destinations. Only scans when
+        # the command contains a deletion verb (rm/rmdir/unlink/shred/find-
+        # -delete/truncate) — avoids false positives on `git commit -m
+        # "...audit-grep-quota.json..."` and similar non-destructive uses.
+        # Parser-independent within the deletion class; closes V1-V5 from
+        # sec-1-residual.
+        _DELETION_VERB = re.compile(
+            r"\b(rm|rmdir|unlink|shred|truncate)\b|\bfind\b[^|;&]*-delete\b"
+        )
+        if task_dir is not None and _DELETION_VERB.search(command):
+            from write_policy import _CONTROL_PLANE_EXACT
+            for cp_name in _CONTROL_PLANE_EXACT:
+                if cp_name in command:
+                    cp_path = (task_dir / cp_name).resolve()
+                    if str(cp_path) not in destinations and cp_name not in destinations:
+                        destinations.append(str(cp_path))
+
+        if not destinations:
+            # No write pattern matched -- pass without policy check
+            return 0
+
+        # Check each destination through decide_write
+        for raw_dest in destinations:
+            dest_path = _resolve_path(raw_dest, cwd)
+            attempt = WriteAttempt(
+                role=role,
+                task_dir=task_dir,
+                path=dest_path,
+                operation="modify",
+                source="agent",
+            )
+            attempt, decision = _decide_for_roles(attempt, candidate_roles)
+            _emit_policy_event(attempt, decision)
+
+            # Emit structured bash_check event
+            try:
+                if log_event is not None and task_dir is not None:
+                    root = task_dir.parent.parent
+                    log_event(
+                        root,
+                        "pre_tool_use_bash_check",
+                        task=task_dir.name,
+                        command=command[:120],
+                        destination=str(dest_path),
+                        role=role,
+                        allowed=decision.allowed,
+                        reason=decision.reason,
+                    )
+            except Exception:
+                pass
+
+            if not decision.allowed:
+                print(_format_denial(role, dest_path, decision) + degraded_hint, file=sys.stderr)
+                return 2
+
+        return 0
+
+    # -----------------------------------------------------------------
+    # Handle Write, Edit, MultiEdit tools: extract the target file path
+    # -----------------------------------------------------------------
+    if tool_name in ("Write", "Edit", "MultiEdit"):
+        if tool_name == "MultiEdit":
+            edits = tool_input.get("edits", []) if isinstance(tool_input, dict) else []
+            if not isinstance(edits, list):
+                print("pre-tool-use: MultiEdit edits is not a list", file=sys.stderr)
+                return 1
+            paths_to_check: list[Path] = []
+            for edit in edits:
+                fp = edit.get("file_path", "") if isinstance(edit, dict) else ""
+                if fp:
+                    paths_to_check.append(_resolve_path(fp, cwd))
+            if not paths_to_check:
+                print("pre-tool-use: MultiEdit has no edits with file_path", file=sys.stderr)
+                return 1
+        else:
+            if not isinstance(tool_input, dict):
+                print("pre-tool-use: tool_input is not a dict", file=sys.stderr)
+                return 1
+            raw_path = tool_input.get("file_path", tool_input.get("path", ""))
+            if not raw_path:
+                print("pre-tool-use: no file_path found in tool_input", file=sys.stderr)
+                return 1
+            paths_to_check = [_resolve_path(raw_path, cwd)]
+
+        for target_path in paths_to_check:
+            attempt = WriteAttempt(
+                role=role,
+                task_dir=task_dir,
+                path=target_path,
+                operation="modify",
+                source="agent",
+            )
+            attempt, decision = _decide_for_roles(attempt, candidate_roles)
+            _emit_policy_event(attempt, decision)
+
+            if not decision.allowed:
+                print(_format_denial(role, target_path, decision) + degraded_hint, file=sys.stderr)
+                return 2
+
+        return 0
+
+    # -----------------------------------------------------------------
+    # Handle Read, Grep, Glob tools: enforce read policy for audit roles
+    # and the investigator's dossier-only guarantee
+    # -----------------------------------------------------------------
+    if tool_name in ("Read", "Grep", "Glob"):
+        # Investigator (D7-3): "the LLM never gathers evidence on its own"
+        # is enforced here, not just promised in prose. Reads are allowed
+        # only inside .dynos/investigations/ (the dossier and its siblings)
+        # or for files the dossier itself references; Grep/Glob are denied
+        # outright — searching IS evidence-gathering.
+        if role == "investigator":
+            if tool_name in ("Grep", "Glob"):
+                print(
+                    "read-policy: investigator is dossier-only — Grep/Glob "
+                    "are evidence-gathering and are denied [dynos-work "
+                    "guardrail]. Cite pre-minted evidence IDs from the "
+                    "dossier instead.",
+                    file=sys.stderr,
+                )
+                return 2
+            raw_path = ""
+            if isinstance(tool_input, dict):
+                raw_path = tool_input.get("file_path") or tool_input.get("path") or ""
+            target = _resolve_path(str(raw_path), cwd) if raw_path else cwd
+            # Locate the project .dynos root: task dir wins, else cwd walk.
+            dynos_root: Path | None = None
+            if task_dir is not None:
+                dynos_root = task_dir.parent
+            else:
+                for ancestor in [cwd, *cwd.parents]:
+                    if _is_project_dynos_dir(ancestor / ".dynos"):
+                        dynos_root = ancestor / ".dynos"
+                        break
+            if dynos_root is not None:
+                investigations = (dynos_root / "investigations").resolve()
+                try:
+                    target.relative_to(investigations)
+                    return 0  # dossier and investigation artifacts: allowed
+                except ValueError:
+                    pass
+                # Files referenced by the most recent dossier are citable —
+                # allow confirming a citation snippet.
+                try:
+                    dossiers = sorted(investigations.glob("*/dossier.json"))
+                    if dossiers:
+                        dossier_text = dossiers[-1].read_text(encoding="utf-8", errors="ignore")
+                        project_root = dynos_root.parent.resolve()
+                        try:
+                            rel = target.resolve().relative_to(project_root).as_posix()
+                        except ValueError:
+                            rel = None
+                        if rel and rel in dossier_text:
+                            return 0
+                except OSError:
+                    pass
+            print(
+                f"read-policy: investigator is dossier-only — {target} is "
+                "neither under .dynos/investigations/ nor referenced by the "
+                "dossier [dynos-work guardrail].",
+                file=sys.stderr,
+            )
+            return 2
+
+        # Planning role: per-phase repository read quota (read_policy
+        # ``_handle_planner_read``). No stage guard and no audit-plan — the
+        # planner runs before any audit plan exists. Without this branch the
+        # non-audit early return below made the planner quota unreachable
+        # from the hook, so it was enforced in unit tests only.
+        if role == "planning":
+            if task_dir is None:
+                return 0
+            target, raw_pattern, err = _extract_read_target(tool_name, tool_input, cwd)
+            if err:
+                print(f"pre-tool-use: {err}", file=sys.stderr)
+                return 1
+            attempt = ReadAttempt_RP(
+                role=role,
+                task_dir=task_dir,
+                target=target,
+                tool_name=tool_name,
+                raw_pattern=raw_pattern,
+            )
+            decision = decide_read(attempt, audit_plan=None)
+            try:
+                _emit_read_policy_event(attempt, decision)
+            except Exception:
+                pass
+            if not decision.allowed:
+                print(f"read-policy: {decision.reason}", file=sys.stderr)
+                return 2
+            return 0
+
+        # AC 16: non-audit roles bypass read-policy enforcement entirely.
+        if not role.startswith("audit-"):
+            return 0
+
+        # No task_dir: cannot enforce stage/diff scope; passthrough.
+        if task_dir is None:
+            return 0
+
+        # AC 15: stage guard. Read manifest.json; on any read/parse exception
+        # (including FileNotFoundError when the file is missing), fail-closed.
+        # Permitted stages source: spec.md AC 15 (PLAN_AUDIT, CHECKPOINT_AUDIT,
+        # FINAL_AUDIT, REPAIR_PLANNING, REPAIR_EXECUTION).
+        permitted_stages = {
+            "PLAN_AUDIT", "CHECKPOINT_AUDIT", "FINAL_AUDIT",
+            "REPAIR_PLANNING", "REPAIR_EXECUTION",
+        }
+        try:
+            manifest_data = json.loads((task_dir / "manifest.json").read_text())
+            stage = manifest_data.get("stage", "")
+        except Exception:
+            print(
+                "read-policy: manifest unreadable; denying audit-* tool call",
+                file=sys.stderr,
+            )
+            return 2
+        if stage not in permitted_stages:
+            print(
+                f"read-policy: audit role not permitted at stage {stage}",
+                file=sys.stderr,
+            )
+            return 2
+
+        # AC 13/14: load audit-plan.json with distinct missing/invalid events.
+        audit_plan = None
+        audit_plan_path = task_dir / "audit-plan.json"
+        if not audit_plan_path.exists():
+            # Missing: emit pre_tool_use_audit_plan_missing
+            try:
+                if log_event is not None:
+                    log_event(
+                        task_dir.parent.parent,
+                        "pre_tool_use_audit_plan_missing",
+                        task=task_dir.name,
+                        tool_name=tool_name,
+                    )
+            except Exception:
+                pass
+        else:
+            # Exists: parse and validate. Any failure → audit_plan=None +
+            # pre_tool_use_audit_plan_invalid.
+            invalid = False
+            try:
+                parsed = json.loads(audit_plan_path.read_text())
+                if isinstance(parsed, dict) and isinstance(parsed.get("diff_files"), list):
+                    audit_plan = parsed
+                else:
+                    invalid = True
+            except Exception:
+                invalid = True
+            if invalid:
+                audit_plan = None
+                try:
+                    if log_event is not None:
+                        log_event(
+                            task_dir.parent.parent,
+                            "pre_tool_use_audit_plan_invalid",
+                            task=task_dir.name,
+                            tool_name=tool_name,
+                        )
+                except Exception:
+                    pass
+
+        # AC 3: extract target per tool. tool_input must be a dict.
+        target, raw_pattern, err = _extract_read_target(tool_name, tool_input, cwd)
+        if err:
+            print(f"pre-tool-use: {err}", file=sys.stderr)
+            return 1
+
+        attempt = ReadAttempt_RP(
+            role=role,
+            task_dir=task_dir,
+            target=target,
+            tool_name=tool_name,
+            raw_pattern=raw_pattern,
+        )
+        decision = decide_read(attempt, audit_plan=audit_plan)
+        try:
+            _emit_read_policy_event(attempt, decision)
+        except Exception:
+            pass
+
+        if not decision.allowed:
+            print(f"read-policy: {decision.reason}", file=sys.stderr)
+            return 2
+        return 0
+
+    # Unknown tool name -- pass without policy check
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"pre-tool-use: internal error: {exc}", file=sys.stderr)
+        sys.exit(1)

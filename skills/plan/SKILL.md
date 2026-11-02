@@ -1,0 +1,147 @@
+---
+name: plan
+description: "Internal dynos-work skill. Re-run planning on an existing task — regenerates the plan after spec changes, or when the task was started externally. Runs PLANNING → PLAN_REVIEW → PLAN_AUDIT with deterministic artifact validation. Runs only when the user explicitly types /dynos-work:plan; never auto-triggered from conversation or by planning requests."
+---
+
+# dynos-work: Plan
+
+
+## Command Funnel (applies to every command in this skill)
+
+Every deterministic step below runs through the plugin CLI. Resolve it once at the start of the skill and substitute the ABSOLUTE path literally into each command you run (permission prefix-matching operates on literal command text):
+
+```bash
+PLUGIN_ROOT="${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
+if [ -z "$PLUGIN_ROOT" ]; then
+  # Some sessions leave both unset. The plugin root is two levels above this
+  # skill's base directory (printed when the skill loads); substitute it here.
+  PLUGIN_ROOT="$(cd "{skill_base_dir}/../.." && pwd)"
+fi
+if [ ! -x "$PLUGIN_ROOT/bin/dynos" ]; then
+  echo "Cannot locate the dynos-work plugin root; set CODEX_PLUGIN_ROOT or CLAUDE_PLUGIN_ROOT." >&2
+  exit 2
+fi
+DYNOS="${PLUGIN_ROOT}/bin/dynos"   # resolve once; use the absolute path in every command
+```
+
+`"$DYNOS" ctl <subcommand>` wraps `hooks/ctl.py`; `"$DYNOS" hook <script> ...` wraps helper scripts (router, lib_tokens, build_prompt_context, ...) with PYTHONPATH handled internally. A permissions-ON user can allow the single `<plugin-root>/bin/dynos` prefix once instead of approving every call.
+
+### On validation failure
+
+Run `ctl planner-retry <task_dir> --phase plan`. If allowed, spawn or resume planning in **Repair** phase with the structured JSON errors, record which in the log, and rerun the same validator. Edit only the named artifact and location. When the retry budget is exhausted, present **provide guidance** (one final Repair pass), **accept with justification** (only if policy allows), or **fail task**. Judgment feedback gets at most one Repair pass.
+
+JSON payloads (classification, execution-graph, repair-log) are piped to the ctl wrapper over stdin with `--from -` and a heredoc — NEVER staged at `/tmp` or any raw filesystem path (the write policy denies those, by design). Temp files, when genuinely needed, belong in `.dynos/task-{id}/_scratch/`.
+
+Re-runs the planning phase on an existing task. Use this when:
+- You need to regenerate the plan after manual spec changes
+- The task was initialized externally and skipped planning
+- You want to replan after a major scope change
+
+When done, the task is ready for `/dynos-work:execute`.
+
+## Ruthlessness Standard
+
+- Treat a vague plan as a delayed execution failure.
+- Do not accept coverage by implication. Every acceptance criterion needs an explicit owner and mechanism.
+- If the plan does not name failure modes, rollback impact, and verification strategy, it is incomplete.
+
+## What you do
+
+### Step 1 — Find active task
+
+Find the most recent active task in `.dynos/` (manifest.json with stage not DONE/FAILED). If none, print "No active task. Start one with /dynos-work:start" and stop.
+
+Read `manifest.json`, `spec.md`, and `design-decisions.md` (if it exists).
+
+Verify `spec.md` exists. If not, print "No spec found. Run /dynos-work:start to generate one." and stop.
+
+### Step 2 — Generate plan (PLANNING)
+
+Transition the stage by running:
+
+```text
+"$DYNOS" ctl transition .dynos/task-{id} PLANNING
+```
+
+Append to execution log (transition_task already auto-logged the `[STAGE] → PLANNING` line; only emit the `[SPAWN]` line):
+```
+{timestamp} [SPAWN] planning — generate implementation plan
+```
+
+Spawn the `planning` agent with instruction: "Generate the implementation plan and execution graph. Read `spec.md`, `design-decisions.md` (if it exists), and `design-doc.md` (if it exists — §11 lists the intended segment shape your execution graph must match). Human design choices are binding. Write `plan.md` directly to `.dynos/task-{id}/plan.md`. For the execution graph, persist the final `.dynos/task-{id}/execution-graph.json` ONLY via `"$DYNOS" ctl write-execution-graph .dynos/task-{id} --from -`, piping the JSON payload over stdin with a heredoc (never stage it at /tmp or any raw path). Include: technical approach, module/component breakdown, data flow, error handling, failure modes, rollback or migration risk where relevant, test strategy, and explicit file ownership per segment. Do not leave any acceptance criterion covered only by implication. Do not hand-write `.dynos/task-{id}/execution-graph.json`."
+
+Wait for completion. Finalize planning through the deterministic control-plane entrypoint. Run:
+
+```text
+"$DYNOS" ctl run-planning .dynos/task-{id}
+```
+
+`run-planning` owns full deterministic artifact validation, writes the `plan-validated` receipt, and advances `PLANNING -> PLAN_REVIEW` when the artifacts are sound. If it exits non-zero, the JSON payload tells you exactly why replanning is required.
+
+Record completion (the ctl command above may already advance to `PLAN_REVIEW`; only the `[DONE]` line is yours, and it goes through `log-append` — never append to `execution-log.md` directly):
+```bash
+"$DYNOS" ctl log-append .dynos/task-{id} --tag DONE --message "planning — plan.md written"
+```
+
+### Step 3 — Human review (PLAN_REVIEW)
+
+Read `plan.md`. Present to the user using **AskUserQuestion**:
+
+```
+=== Plan Review ===
+
+[contents of plan.md]
+
+---
+Approve this plan? (yes / no + what to change)
+```
+
+- If **approved**: run the `approve-stage` ctl command below. It hashes the current `plan.md`, writes the `human-approval-PLAN_REVIEW` receipt with that hash, then transitions PLAN_REVIEW → PLAN_AUDIT in one atomic step. The hash is computed from the CURRENT `plan.md` content **at transition time** (the `transition_task` gate re-hashes the file and compares it to `receipt.artifact_sha256`), so an approval that races against a manual edit to `plan.md` after the receipt is written will be refused with the literal substrings `human-approval-PLAN_REVIEW` and `hash mismatch`. Do NOT add a manual `[HUMAN]` log line — the receipt is the audit trail. Then proceed to Step 4.
+
+  ```text
+  "$DYNOS" ctl approve-stage .dynos/task-{id} PLAN_REVIEW
+  ```
+
+  Exit code 0 means success; exit code 1 means the gate refused (stderr identifies the cause: missing artifact, hash drift, illegal transition). Do not bypass with `transition --force`.
+- If **changes requested**: append the feedback and use one Repair pass on the named artifact. Re-present the updated plan. Do NOT call `approve-stage` until the live `plan.md` matches what the user approved.
+- If **rejected**: run `"$DYNOS" ctl transition .dynos/task-{id} FAILED`, append `[FAILED] Plan rejected by user`. Stop. Do not edit `manifest.json` directly.
+
+### Step 4 — Spec coverage audit (PLAN_AUDIT)
+
+The `approve-stage` call in Step 3 has already advanced the manifest to `PLAN_AUDIT` and auto-logged the `[STAGE] → PLAN_AUDIT` transition line — do NOT call `transition .dynos/task-{id} PLAN_AUDIT` here (the state machine would refuse it as `PLAN_AUDIT → PLAN_AUDIT`).
+
+Run the deterministic plan-audit controller first:
+
+```text
+"$DYNOS" ctl run-plan-audit .dynos/task-{id}
+```
+
+Interpret the JSON result:
+
+- `gap_advisory == true` (alongside `status == "passed"` or `"llm_audit_required"`): gap analysis missed some API Contracts / Data Model claims, but the approved plan is unchanged since `run-planning` validated it (the `plan-validated` receipt hashes still match), so the misses are scanner false negatives or repo drift, not plan defects. They are recorded in `gap_warnings`, in `plan-audit-gap-warnings.json`, and in the `plan-audit-check` receipt; print them once and continue. Do not repair `plan.md` and do not send the task back to PLANNING over them: execution and audit verify each one.
+- `status == "replan_required"`: deterministic gap analysis found errors in a plan that changed since `run-planning` validated it (or has no passing `plan-validated` receipt). The human already approved this plan, so ctl has moved the task back to `PLANNING` (`transitioned_to`). Follow **On validation failure**, then run Step 2's `run-planning` and Step 3's review again so the repaired plan is re-approved, and only then rerun this step. Never edit `plan.md` while the task is at `PLAN_AUDIT`: `run-execute-setup` refuses a plan changed after approval.
+- `status == "passed"` with `mode == "deterministic_only"`: the deterministic audit is authoritative at every risk level. The command wrote the hash-bound `plan-audit-check` receipt itself (`receipt_cached: true` means a fresh receipt already existed and nothing was redone). Do NOT spawn an auditor.
+- `status == "llm_audit_required"`: only appears when the project opted in through `policy.plan_audit_llm`. Spawn `spec-completion-auditor`, then finalize with:
+
+  ```text
+  "$DYNOS" ctl run-plan-audit .dynos/task-{id} --report-path .dynos/task-{id}/audit-reports/plan-audit-{timestamp}.json --tokens-used {TOTAL_TOKENS} --model {MODEL_USED}
+  ```
+
+If the final `run-plan-audit` call returns `status == "replan_required"`, handle it the same way: repair, `run-planning`, re-approve, then rerun it. If it returns `status == "passed"`, proceed.
+
+### Step 5 — Done
+
+Transition the stage by running:
+
+```text
+"$DYNOS" ctl transition .dynos/task-{id} PRE_EXECUTION_SNAPSHOT
+```
+
+(`transition_task` auto-appends the `[STAGE] → PRE_EXECUTION_SNAPSHOT` line; do not write an `[ADVANCE]` line by hand.)
+
+Print:
+```
+Plan approved and audited. All acceptance criteria covered.
+
+Next: /dynos-work:execute
+```

@@ -1,0 +1,91 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" pre-tool-use",
+            "async": false
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" pre-tool-use",
+            "async": false
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" agent-spawn-log pre",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" agent-spawn-log post",
+            "async": false
+          }
+        ]
+      },
+      {
+        "matcher": "WebSearch|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" web-tool-log",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" session-start",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" task-completed"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/hooks/run-hook.cmd\" subagent-tokens",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

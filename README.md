@@ -1,0 +1,82 @@
+<p align="center">
+  <a href="https://dynos.fit">
+    <img src="dynos-logo-dark.svg" alt="dynos.fit" />
+  </a>
+</p>
+
+# dynos-work
+
+A Claude Code and Codex plugin that builds features, catches its own bugs, and gets better at your codebase over time.
+
+## Install
+
+### Claude Code
+
+```
+claude plugin marketplace add dynos-fit/dynos-work
+claude plugin install dynos-work
+```
+
+### Codex
+
+This repo also includes a Codex plugin manifest at `.codex-plugin/plugin.json`. Install it through your Codex plugin workflow from this repository root.
+
+## Use
+
+### Claude Code
+
+```
+/dynos-work:start build a user settings page
+```
+
+### Codex
+
+Invoke the `start` skill with your task, for example: "Use dynos-work start to build a user settings page."
+
+That's it. You'll answer a few questions about what you want, approve a spec, approve a plan — then it builds.
+
+## What happens
+
+When you start a task, the plugin:
+
+1. **Asks what you need** — a few targeted questions to nail down scope
+2. **Writes a spec** — exact behavior, edge cases, what's out of scope. You approve it.
+3. **Writes a plan** — which files change, in what order, how it'll be tested. You approve it.
+4. **Builds in parallel** — multiple agents work on independent pieces simultaneously
+5. **Audits its own work** — independent agents check for bugs, security issues, and spec gaps
+6. **Repairs what it finds** — automatically, up to 3 attempts before it asks you
+
+After the task, it learns from what went wrong and builds prevention rules for next time. Your 10th task is better than your 1st.
+
+## Commands
+
+```
+/dynos-work:start [task]       start a new task
+/dynos-work:execute            run the approved plan
+/dynos-work:audit              audit, repair, and close
+/dynos-work:status             check where your task is
+/dynos-work:resume             continue after interruption
+/dynos-work:investigate [bug]  deep bug investigation
+/dynos-work:residual           inspect or drain non-blocking findings
+```
+
+## Requirements
+
+Claude Code or Codex, plus Python 3 for the local dynos-work control plane.
+
+## Running with permissions ON
+
+The pipeline works without `--dangerously-skip-permissions`. Every deterministic step funnels through one binary — `<plugin-root>/bin/dynos` — so you can allow that single command prefix once (via the permission prompt's "don't ask again" or a `Bash(<plugin-root>/bin/dynos ...)` allow rule in your settings) and then you only interact with the decisions that are actually yours: discovery questions, spec approval, plan approval, and TDD review. Plugin guardrail denials are not Claude Code permission errors — they say so explicitly and name the sanctioned alternative. Details: `docs/write-boundary-spec.md`.
+
+The write guardrail is exact for the `Write`/`Edit` tools and for ctl's own writes. For `Bash` it is best effort: it parses the command text for redirects, write verbs (`tee`, `cp`, `mv`, `install`, `rm`, `dd of=`), in-place editors (`sed -i`, `perl -i`) and literal-path writes in inline interpreter code (`python3 -c`, a heredoc'd `python3 -`, `node -e`, `ruby -e`, `perl -e`). A script file on disk, a path computed at run time, or a write from a subprocess is not seen. Treat it as a tripwire, not a sandbox. The backstop for writes it cannot see is a git write-scope check: every file changed since the task snapshot (including untracked files and deletions) must be declared by a segment's `files_expected`/`files_optional`, a repair cycle's `files_to_modify` or the TDD test files. `run-execution-segment-done` and `run-audit-findings-gate` report the rest as `out_of_scope_files`, and the DONE gate refuses until each is reverted or a human acknowledges it with `ctl acknowledge-out-of-scope <task_dir> --file <path> --reason "..."`.
+
+## Links
+
+- [Changelog](CHANGELOG.md)
+- [Internals & CLI reference](INTERNALS.md)
+- [Architecture](ARCHITECTURE.md)
+- [Pipelines](PIPELINES.md)
+
+---
+
+> Completion is a control decision, not a model opinion.

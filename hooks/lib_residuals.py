@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""Proactive residual-findings queue (task-20260504-007).
+
+Producer/consumer queue for non-blocking audit findings. The queue lives at
+``<root>/.dynos/proactive-findings.json`` with shape ``{"findings": [...]}``.
+
+This module is intentionally independent of ``ctl.py``. It depends only on
+``lib_core`` (for ``load_json``/``write_json``) and the Python standard
+library so the producer hook can use it without importing the full ctl
+machinery, and so the run-next skill can use it from a separate process.
+
+Concurrency model
+-----------------
+``ingest_findings`` and ``update_row_status`` both perform the read-modify-
+write under a single ``fcntl.LOCK_EX`` held on the queue file FD itself
+(not on a temp file). Writes go through a same-directory temp file followed
+by ``os.rename`` for crash safety; the rename happens while the lock is
+still held so concurrent callers serialize cleanly.
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from lib_core import load_json
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ALLOWED_AUDITORS: frozenset[str] = frozenset({
+    "claude-md-auditor",
+    "code-quality-auditor",
+    "dead-code-auditor",
+    "docs-accuracy-auditor",
+    "performance-auditor",
+    "release-auditor",
+    "security-auditor",
+    "test-strategy-auditor",
+    "ui-auditor",
+})
+
+# Postmortem prevention-rule enforcement values that are actionable
+# engineering work (worth queuing). Values like "review-checklist",
+# "prompt-constraint", and "advisory" are deliberately excluded — they
+# describe judgment-based gates, not buildable items.
+ACTIONABLE_ENFORCEMENTS: frozenset[str] = frozenset({
+    "test",
+    "lint",
+    "static-check",
+    "ci-gate",
+    "runtime-guard",
+})
+
+REJECTED_CATEGORIES: frozenset[str] = frozenset({
+    "tool-error",
+    "no-rules-found",
+    "no-files-changed",
+})
+
+VALID_STATUSES: frozenset[str] = frozenset({
+    "pending",
+    "in_progress",
+    "done",
+    "failed",
+})
+
+DEDUP_BLOCKING_STATUSES: frozenset[str] = frozenset({
+    "pending",
+    "in_progress",
+})
+
+# Anchored HTML-comment regex. Both the ``<!-- residual-id: `` prefix and
+# the closing `` -->`` suffix must be present; a bare ``residual-id:``
+# substring must NOT match (spec.md Risk Note 4).
+#
+# The ID payload is one or more characters that are NOT whitespace and do
+# NOT contain ``-->``. We use a greedy-but-bounded character class that
+# rejects whitespace and the ``>`` character to keep the pattern linear-
+# time and ReDoS-free (no nested quantifiers, no alternation over the
+# same prefix).
+_RESIDUAL_ID_RE = re.compile(r"<!-- residual-id: ([^\s>]+) -->")
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def queue_path(root: Path) -> Path:
+    """Return the canonical queue-file path for a project root."""
+    return Path(root) / ".dynos" / "proactive-findings.json"
+
+
+def _stable_lockfile_path(root: Path) -> Path:
+    """Return the stable lock-file path (never renamed, never the queue itself).
+
+    The lock is held on THIS file's FD. The queue file is written via
+    os.rename(tmp, qpath) which replaces the queue inode; the lock inode
+    is separate and stable across all renames, so concurrent callers always
+    contend on the same inode and serialize correctly.
+    """
+    return queue_path(root).with_suffix(".json.lock")
+
+
+def load_queue(qpath: Path) -> dict:
+    """Read the queue file and return ``{"findings": [...]}``.
+
+    Returns ``{"findings": []}`` if the file is absent. Does NOT create the
+    file as a side-effect of reading.
+    """
+    p = Path(qpath)
+    if not p.exists():
+        return {"findings": []}
+    try:
+        data = load_json(p)
+    except (json.JSONDecodeError, OSError):
+        # Corrupt or unreadable queue is treated as empty rather than
+        # surfaced — the producer must never crash the audit pipeline.
+        return {"findings": []}
+    if not isinstance(data, dict):
+        return {"findings": []}
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return {"findings": []}
+    return {"findings": findings}
+
+
+def compute_fingerprint(auditor_name: str, finding_id: str, description: str) -> str:
+    """Lowercase hex SHA-256 of ``auditor_name + ':' + finding_id + ':' + description``.
+
+    No salt; deterministic across processes so dedup works between the
+    producer and any future replays.
+    """
+    payload = f"{auditor_name}:{finding_id}:{description}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def extract_residual_id(raw_input_text: str) -> Optional[str]:
+    """Return the first residual-id from a fully-formed HTML comment.
+
+    Matches ``<!-- residual-id: <id> -->`` exactly. A bare
+    ``residual-id:`` substring without both delimiters does not match.
+    Returns ``None`` if the pattern is absent or input is not a string.
+    """
+    if not isinstance(raw_input_text, str):
+        return None
+    m = _RESIDUAL_ID_RE.search(raw_input_text)
+    if m is None:
+        return None
+    return m.group(1)
+
+
+def select_next_pending(root: Path) -> Optional[dict]:
+    """Return the oldest eligible pending row, or ``None``.
+
+    Eligibility:
+      - ``status == "pending"``
+      - ``attempts < 3``
+      - every entry in optional ``depends_on`` (list of residual ids)
+        resolves to a row whose ``status == "done"`` in the same queue.
+        Missing dependency ids are treated as unsatisfied (a typoed dep
+        blocks selection — fail-closed). An empty / absent ``depends_on``
+        list is unconstrained (backward-compatible default).
+
+    Ordering is by ``created_at`` ascending (lexicographic on the ISO-8601
+    string). Missing queue file returns ``None`` without raising.
+    """
+    qp = queue_path(root)
+    q = load_queue(qp)
+    findings = q.get("findings", [])
+
+    # Index ids → status for dependency resolution.
+    status_by_id: dict[str, str] = {}
+    for row in findings:
+        if isinstance(row, dict):
+            rid = row.get("id")
+            st = row.get("status")
+            if isinstance(rid, str) and isinstance(st, str):
+                status_by_id[rid] = st
+
+    def _deps_satisfied(row: dict) -> bool:
+        deps = row.get("depends_on")
+        if not isinstance(deps, list) or not deps:
+            return True
+        for dep_id in deps:
+            if not isinstance(dep_id, str):
+                return False  # malformed dep entry blocks selection
+            if status_by_id.get(dep_id) != "done":
+                return False
+        return True
+
+    eligible = [
+        row
+        for row in findings
+        if isinstance(row, dict)
+        and row.get("status") == "pending"
+        and isinstance(row.get("attempts"), int)
+        and row.get("attempts", 0) < 3
+        and _deps_satisfied(row)
+    ]
+    if not eligible:
+        return None
+    eligible.sort(key=lambda r: r.get("created_at", ""))
+    return eligible[0]
+
+
+def update_row_status(root: Path, row_id: str, new_status: str) -> None:
+    """Update ``status`` of the single row whose ``id`` matches ``row_id``.
+
+    Raises ``ValueError`` if ``new_status`` is not one of the four valid
+    statuses, or if ``row_id`` is not present in the queue. Performs a
+    LOCK_EX read-modify-write on the queue file FD.
+
+    Does NOT increment ``attempts``. The attempts counter is owned by the
+    consumer (run-next), not by status updates.
+    """
+    if new_status not in VALID_STATUSES:
+        raise ValueError(
+            f"invalid status {new_status!r}; must be one of {sorted(VALID_STATUSES)}"
+        )
+
+    qp = queue_path(root)
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    lp = _stable_lockfile_path(root)
+
+    # Lock a SEPARATE stable lock file (never renamed) so the inode that
+    # fcntl.flock binds to is never replaced by os.rename(tmp, qpath).
+    # Concurrent callers contend on the same stable inode and serialize.
+    lock_fd: int = -1
+    try:
+        lock_fd = os.open(str(lp), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            current = load_queue(qp)
+            findings = current.get("findings", [])
+
+            target_index = None
+            for i, row in enumerate(findings):
+                if isinstance(row, dict) and row.get("id") == row_id:
+                    target_index = i
+                    break
+            if target_index is None:
+                raise ValueError(f"row_id {row_id!r} not found in queue")
+
+            findings[target_index]["status"] = new_status
+            if new_status == "in_progress":
+                findings[target_index]["last_attempt_at"] = _now_iso_z()
+
+            _atomic_write_under_lock(qp, {"findings": findings})
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+
+
+def ingest_findings(
+    task_dir_or_root: Path,
+    root_or_findings: "Path | list",
+    summary: Optional[dict] = None,
+) -> int:
+    """Producer entry point. Append admitted residuals to the queue.
+
+    Supports two call signatures:
+
+    Legacy (3-arg): ingest_findings(task_dir, root, summary)
+        Reads per-auditor report files referenced in ``summary["reports"]``
+        and applies the four-condition residual filter before appending.
+
+    Direct (2-arg): ingest_findings(root, findings)
+        Appends a list of pre-built finding dicts directly.  Each dict must
+        carry a ``"fingerprint"`` key; rows whose fingerprint already exists
+        in the queue with a DEDUP_BLOCKING_STATUSES status are skipped.
+
+    Returns the number of rows actually appended (after filter and dedup).
+    Concurrency-safe: dedup check + append happen under a single
+    ``fcntl.LOCK_EX`` held on the STABLE lock file (never renamed), so
+    os.rename inside _atomic_write_under_lock never orphans the lock inode.
+
+    Never raises on a filtered or malformed finding — those are silently
+    skipped. May raise on irrecoverable IO (caller in cmd_run_audit_finish
+    is expected to catch and log).
+    """
+    # --- Signature dispatch ---
+    if isinstance(root_or_findings, list):
+        # 2-arg direct API: ingest_findings(root, findings_list)
+        root: Path = Path(task_dir_or_root)
+        raw_candidates: list[dict] = root_or_findings
+        candidates: list[dict] = []
+        for item in raw_candidates:
+            if not isinstance(item, dict):
+                continue
+            fp = item.get("fingerprint")
+            if not isinstance(fp, str) or not fp:
+                continue
+            # Use the item as-is: preserve its fingerprint field so the
+            # caller's fingerprint reaches the queue unchanged.
+            row: dict = dict(item)
+            if "id" not in row:
+                row["id"] = str(uuid.uuid4())
+            if "created_at" not in row:
+                row["created_at"] = _now_iso_z()
+            candidates.append(row)
+    else:
+        # 3-arg legacy API: ingest_findings(task_dir, root, summary)
+        root = Path(root_or_findings)
+        if not isinstance(summary, dict):
+            return 0
+
+        task_id = summary.get("task_id", "")
+        if not isinstance(task_id, str):
+            task_id = ""
+
+        reports = summary.get("reports", [])
+        if not isinstance(reports, list):
+            return 0
+
+        # Stage 1: collect candidate rows from per-auditor reports (no IO
+        # into the queue yet).  Each candidate is a fully-formed row dict
+        # ready for dedup and append.
+        candidates = []
+        for report_entry in reports:
+            if not isinstance(report_entry, dict) or report_entry.get("superseded_by"):
+                # Superseded reports (older attempts, overruled voting
+                # tiers) describe findings a later verdict replaced.
+                continue
+            auditor_name = report_entry.get("auditor_name")
+            report_path = report_entry.get("report_path")
+            if not isinstance(auditor_name, str) or not isinstance(report_path, str):
+                continue
+            if auditor_name not in ALLOWED_AUDITORS:
+                # Whole report skipped — no need to read it.
+                continue
+
+            try:
+                report_data = load_json(Path(report_path))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                # Missing or corrupt per-auditor report is a soft failure
+                # for the residual pipeline; the audit-summary itself is
+                # the authoritative pipeline output.
+                continue
+            if not isinstance(report_data, dict):
+                continue
+            findings = report_data.get("findings", [])
+            if not isinstance(findings, list):
+                continue
+
+            for finding in findings:
+                if not _accept_finding(finding, auditor_name):
+                    continue
+                candidates.append(_build_row(finding, auditor_name, task_id))
+
+    if not candidates:
+        return 0
+
+    # Stage 2: critical section — acquire STABLE lock, read queue, dedup,
+    # append, atomic rename.
+    #
+    # The lock is held on a SEPARATE stable lock file (never renamed), NOT
+    # on the queue file FD.  os.rename(tmp, qpath) inside
+    # _atomic_write_under_lock replaces the queue inode; if we locked the
+    # queue FD directly, the second caller would open a brand-new inode
+    # after the rename and get an uncontended lock, causing lost rows.
+    # Locking the stable .lock file means every caller competes on the
+    # same inode regardless of how many times the queue is renamed.
+    qp = queue_path(root)
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    lp = _stable_lockfile_path(root)
+    lock_fd: int = -1
+    try:
+        lock_fd = os.open(str(lp), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            current = load_queue(qp)
+            existing = current.get("findings", [])
+
+            # Build a set of fingerprints that BLOCK new appends —
+            # i.e. fingerprints of rows currently pending or in_progress.
+            # Fingerprints of done/failed rows do NOT block (resurfaced).
+            blocking_fps: set[str] = set()
+            for row in existing:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("status") in DEDUP_BLOCKING_STATUSES:
+                    fp = row.get("fingerprint")
+                    if isinstance(fp, str):
+                        blocking_fps.add(fp)
+
+            # Apply dedup against blocking_fps; also dedup within this
+            # batch so two identical findings in one summary do not both
+            # get appended.
+            appended = 0
+            for cand in candidates:
+                fp = cand.get("fingerprint", "")
+                if fp in blocking_fps:
+                    continue
+                existing.append(cand)
+                if fp:
+                    blocking_fps.add(fp)
+                appended += 1
+
+            if appended > 0:
+                _atomic_write_under_lock(qp, {"findings": existing})
+
+            return appended
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+
+
+def ingest_prevention_rules(root: Path, rules: list) -> int:
+    """Ingest postmortem prevention rules with actionable enforcement.
+
+    Filters to rules whose ``enforcement`` is in ``ACTIONABLE_ENFORCEMENTS``
+    (test, lint, static-check, ci-gate, runtime-guard). Rules with
+    ``review-checklist``, ``prompt-constraint``, or ``advisory`` enforcement
+    are NOT ingested — they describe judgment-based gates, not buildable
+    items.
+
+    Each accepted rule becomes a queue row with ``kind = "residual"`` and
+    ``source_auditor = "postmortem-analysis"``. Fingerprint is
+    ``sha256("postmortem-analysis:" + rule.rule + ":" + rule.rationale)`` —
+    intentionally NOT keyed on enforcement, so a rule that gets escalated
+    from advisory→ci-gate later does not produce a duplicate row.
+
+    Returns the count actually appended (after filter and dedup).
+    Concurrency-safe via the same ``fcntl.LOCK_EX`` pattern as
+    ``ingest_findings``. Never raises on a malformed rule entry — those
+    are silently skipped. May raise on irrecoverable IO; the caller in
+    ``postmortem_analysis.apply_analysis`` is expected to catch and log.
+    """
+    if not isinstance(rules, list):
+        return 0
+
+    candidates: list[dict] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        enforcement = rule.get("enforcement")
+        if not isinstance(enforcement, str) or enforcement not in ACTIONABLE_ENFORCEMENTS:
+            continue
+        rule_text = rule.get("rule")
+        rationale = rule.get("rationale")
+        if not isinstance(rule_text, str) or not rule_text:
+            continue
+        if not isinstance(rationale, str):
+            rationale = ""
+
+        title = rule_text[:120]
+        source_finding = rule.get("source_finding", "")
+        if not isinstance(source_finding, str):
+            source_finding = ""
+        category = rule.get("category", "")
+        if not isinstance(category, str):
+            category = ""
+
+        description_parts = [
+            f"Rule: {rule_text}",
+            f"Rationale: {rationale}" if rationale else "",
+            f"Enforcement: {enforcement}",
+            f"Category: {category}" if category else "",
+            f"Source finding: {source_finding}" if source_finding else "",
+        ]
+        description = "\n".join(p for p in description_parts if p)
+
+        fp = compute_fingerprint("postmortem-analysis", rule_text, rationale)
+
+        candidates.append({
+            "id": str(uuid.uuid4()),
+            "kind": "residual",
+            "fingerprint": fp,
+            "created_at": _now_iso_z(),
+            "source_task_id": "",
+            "source_auditor": "postmortem-analysis",
+            "title": title,
+            "description": description,
+            "location": "",
+            "status": "pending",
+            "attempts": 0,
+            "last_attempt_at": None,
+        })
+
+    if not candidates:
+        return 0
+
+    qp = queue_path(root)
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    lp = _stable_lockfile_path(root)
+    lock_fd: int = -1
+    try:
+        lock_fd = os.open(str(lp), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            current = load_queue(qp)
+            existing = current.get("findings", [])
+
+            blocking_fps: set[str] = set()
+            for row in existing:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("status") in DEDUP_BLOCKING_STATUSES:
+                    f = row.get("fingerprint")
+                    if isinstance(f, str):
+                        blocking_fps.add(f)
+
+            appended = 0
+            for cand in candidates:
+                fp = cand["fingerprint"]
+                if fp in blocking_fps:
+                    continue
+                existing.append(cand)
+                blocking_fps.add(fp)
+                appended += 1
+
+            if appended > 0:
+                _atomic_write_under_lock(qp, {"findings": existing})
+
+            return appended
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _now_iso_z() -> str:
+    """Return current UTC time as ISO-8601 with trailing ``Z``."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _accept_finding(finding: Any, auditor_name: str) -> bool:
+    """Apply the four-condition residual filter (AC-3).
+
+    Returns True iff the finding is admitted as a residual. All four
+    conditions are case-sensitive; ``blocking`` must be the boolean
+    ``False`` (not a falsy int / string / None).
+    """
+    if not isinstance(finding, dict):
+        return False
+    if auditor_name not in ALLOWED_AUDITORS:
+        return False
+
+    blocking = finding.get("blocking")
+    # Strict identity check: must be the boolean False, not 0/""/None.
+    if blocking is not False:
+        return False
+    # Belt-and-suspenders: bool is a subclass of int in Python; the check
+    # above already excludes 0 because ``0 is False`` is False.
+
+    severity = finding.get("severity")
+    if not isinstance(severity, str):
+        return False
+    if severity == "info":
+        return False
+
+    # Schema-shape filter: real findings carry a concrete `remediation`
+    # field. Auditor review notes ("Reviewed X — no exploit found") are
+    # often emitted as severity:minor + blocking:false with empty or
+    # absent remediation, polluting the queue with non-actionable rows.
+    # Two checks:
+    #   (a) any severity: explicit "no change/action/fix required"
+    #       remediation text means the auditor itself classified the row
+    #       as informational. Drop it.
+    #   (b) severity:minor: require a non-empty remediation field. Real
+    #       minor bugs have a fix; review notes don't. Critical/major
+    #       findings keep through this gate even without remediation
+    #       because the severity already justifies follow-up.
+    remediation = finding.get("remediation")
+    if isinstance(remediation, str):
+        rem_stripped = remediation.strip()
+        rem_lower = rem_stripped.lower()
+        if rem_lower.startswith(("no change required", "no action required", "no fix required")):
+            return False
+        if severity == "minor" and not rem_stripped:
+            return False
+    else:
+        # remediation absent entirely
+        if severity == "minor":
+            return False
+
+    category = finding.get("category")
+    if not isinstance(category, str):
+        return False
+    if category in REJECTED_CATEGORIES:
+        return False
+
+    # Required fields for row construction.
+    if not isinstance(finding.get("id"), str):
+        return False
+    if not isinstance(finding.get("description"), str):
+        return False
+    if not isinstance(finding.get("location"), str):
+        return False
+
+    return True
+
+
+def _build_row(finding: dict, auditor_name: str, task_id: str) -> dict:
+    """Construct a queue row from an admitted finding (AC-2 shape)."""
+    description = finding["description"]
+    finding_id = finding["id"]
+    location = finding["location"]
+    fp = compute_fingerprint(auditor_name, finding_id, description)
+    return {
+        "id": str(uuid.uuid4()),
+        "kind": "residual",
+        "fingerprint": fp,
+        "created_at": _now_iso_z(),
+        "source_task_id": task_id,
+        "source_auditor": auditor_name,
+        "title": description[:120],
+        "description": description,
+        "location": location,
+        "status": "pending",
+        "attempts": 0,
+        "last_attempt_at": None,
+    }
+
+
+def _read_locked_queue(fd: int) -> dict:
+    """Read queue contents from an already-locked FD.
+
+    The caller holds LOCK_EX on ``fd``. We seek to 0 and read all bytes.
+    An empty file (just-created) is treated as ``{"findings": []}``.
+    """
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError as exc:  # pragma: no cover - defensive
+            if exc.errno in (errno.EINTR,):
+                continue
+            raise
+        if not chunk:
+            break
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    if not raw.strip():
+        return {"findings": []}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"findings": []}
+    if not isinstance(data, dict):
+        return {"findings": []}
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return {"findings": []}
+    return {"findings": findings}
+
+
+def _atomic_write_under_lock(qpath: Path, data: dict) -> None:
+    """Write ``data`` atomically to ``qpath`` while the queue lock is held.
+
+    The temp file lives in the same directory as ``qpath`` so ``os.rename``
+    is atomic on POSIX. The temp file is NOT locked — locking is on the
+    queue file FD owned by the caller.
+    """
+    parent = qpath.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=".pf-", suffix=".tmp")
+    try:
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            # fdopen took ownership of tmp_fd; if writing failed we still
+            # need to remove the temp file.
+            raise
+        os.rename(tmp_name, str(qpath))
+        tmp_name = None  # rename consumed it
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+__all__ = [
+    "queue_path",
+    "load_queue",
+    "ingest_findings",
+    "ingest_prevention_rules",
+    "select_next_pending",
+    "update_row_status",
+    "extract_residual_id",
+    "compute_fingerprint",
+]

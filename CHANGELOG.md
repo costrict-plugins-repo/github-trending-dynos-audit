@@ -1,0 +1,1230 @@
+# Changelog: dynos-work
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to **Semantic Versioning**.
+
+---
+
+## [Unreleased]
+
+---
+
+## [7.7.4] - 2026-11-01
+### Changed
+- **The planner defaults to the deep tier (`opus`) instead of frontier (`fable`).** 7.5.15 made frontier the planner's default in both `agents/planning.md` and `lib_models.ROLE_DEFAULT_TIERS`, so every `dynos-work:planning` spawn ran at frontier rates. That included spawns that passed no `model` and used the frontmatter. With frontier quota limited, that default was too costly. The frontmatter is now `model: opus` and `ROLE_DEFAULT_TIERS["planning"]` is `deep`. The planner's ceiling stays at frontier (`ROLE_TIER_CEILINGS`), so a `model_overrides` entry, learned routing or exploration can still opt it into frontier. Executors remain capped at deep.
+
+---
+
+## [7.7.3] - 2026-11-01
+### Fixed
+- **Retrospective rows dropped for an unrecognized model are reported.** `_extract_quads` skipped any role whose model was not a known alias, tier or Claude model ID with a bare `continue`, which is how full model IDs could empty every effectiveness score without any sign. The raw model values it skips are now counted. `compute_effectiveness_scores` accepts an `unrecognized_models` dict to receive the counts. When called with `root`, it logs one `effectiveness_models_unrecognized` event with `rows_dropped` and the per-model counts. `patterns.py effectiveness` prints them as `unrecognized_models` (an empty object when nothing was dropped). The pattern-writing pipeline records `unrecognized_model_rows` on its `ema_compute` learn step and in `steps_completed`.
+
+---
+
+## [7.7.2] - 2026-11-01
+### Fixed
+- **Effectiveness scores and model policy work with full Claude model IDs.** On Claude Code the token hook records each agent's model straight from the subagent transcript (`claude-sonnet-5-5`, `claude-fable-5-1`) and deliberately does not normalize it. The policy engine compared those values literally against the aliases and tier names in `VALID_MODELS` (`haiku`, `sonnet`, `opus`, `fable`, `fast`, …), so `_extract_quads` dropped every row. `patterns.py effectiveness` then returned empty `effectiveness_scores`, `model_policy`, `skip_policy` and `routing_composites`, and nothing learned from retrospectives reached the router. The new `lib_models.normalize_model` maps an ID that contains `claude` and exactly one known alias to that alias (`claude-sonnet-5-5` → `sonnet`, `us.anthropic.claude-opus-5-5[1m]` → `opus`), lowercases aliases and tier names, and leaves anything else unchanged. `_extract_quads`, `derive_model_policy` and `_build_model_policy_data` call it on read, so full IDs and aliases for the same family pool into one row. `model_to_tier` and `model_rank` call it too, so a full ID now has a tier and rank. Rank-based checks that go through them, such as the role tier ceiling in `clamp_model_to_role_ceiling`, the security-auditor floor and the circuit breaker's deep-tier predicate, therefore also apply to full IDs, where before they passed through unranked. The recorded transcript value is unchanged on disk.
+
+---
+
+## [7.7.1] - 2026-10-31
+### Fixed
+- **Retrospectives from removed worktrees count toward calibration again.** `_flush_retrospective_on_done` copied the retrospective to the shared `~/.dynos/projects/<id>/retrospectives/`, but wrote its `retrospective_flushed` event to `<root>/.dynos/events.jsonl`. For a task run in a git worktree, `<root>` is the worktree, so the event was deleted with it. `collect_retrospectives` then had no flush record for the file, tagged it `persistent-unverified` and dropped it. A project that cleans up its worktrees never reached `agent_generator auto`'s 5-retrospective gate (seen as `insufficient retrospectives: 0 < 5` with 41 retrospectives on disk). The patterns.py effectiveness scores were empty for the same reason. Each flush now also appends `{task_id, sha256}` to `retrospective-flush-ledger.jsonl` in the persistent project dir. The SEC-003 verifier reads that ledger as well as `events.jsonl`, so a tampered file is still rejected after its worktree is gone. The `collect_retrospectives` docstring no longer claims unverified retrospectives are trusted by default.
+- **`ctl backfill-retro-flush-ledger --root <project> [--dry-run]`** records ledger entries for persistent retrospectives flushed before this release whose events were lost. It hashes each file as it is now, so run it only when that content is trusted. It leaves alone, and reports, any file whose hash disagrees with a known flush record or whose `task_id` doesn't match its filename. It exits 1 on a mismatch. `check-retro-integrity` now recommends this command instead of hand-editing `events.jsonl`.
+- **`agent_generator auto` says when unverified retrospectives were excluded.** The gate message now reads, for example, `insufficient retrospectives: 0 < 5 (41 persistent retrospectives excluded as unverified; …)`, and the result carries `unverified_retrospectives`.
+- **`agent_generator auto` finds agent slots on main.** Candidate (executor role, task type) slots were found by scanning `<root>/.dynos/task-*/execution-graph.json`. Those files exist only in the checkout that ran the task, so after worktree removal no slot was found and nothing was generated. Slots now come from each retrospective's `model_used_by_agent`, the same participation data `_matching_retrospectives` already used, unioned with a sibling execution graph when one exists. The three-sample threshold now counts tasks, not execution-graph segments. Before, one task with three backend segments met it alone.
+- **Task-derived benchmark fixtures compare runs of the learned agent with runs without it.** `synthesize_fixture_for_entry` ranked every task of the agent's type by score and used the top five as the "candidate" and the average of the rest as the baseline. Neither group had run the learned agent, and the top of a ranking beats the rest by construction, so every learned agent passed promotion. Candidate cases are now the most recent tasks whose retrospective `agent_source` shows this learned agent ran for its role, in replace or alongside mode. The baseline is the same-type tasks where the role ran as the generic agent. Tasks run with a different learned agent for the role are excluded from both. When either group is empty, no fixture is produced and any earlier generated fixture for the agent is removed. `min_samples` is always 3; it used to shrink to the number of candidate tasks. A shadow-mode agent is routed to the generic agent and so never gets a task-derived fixture. It needs a rollout or hand-written fixture to be benchmarked, and the calibration skill now says so.
+- **Generated benchmark fixtures are no longer written into the project.** Task-derived fixtures (`fixture.py`) and rollout fixtures (`challenge.py`) went to `<project>/benchmarks/generated/`. That folder is gitignored only in dynos-work itself, so in any other project they appeared as untracked files. They now go to `~/.dynos/projects/<id>/benchmarks/generated/`, which is also where they are read from. Fixtures left in the old repo folder are ignored and can be deleted. Hand-written fixtures in `benchmarks/fixtures/` are unchanged.
+- **Category-trend prevention rules pass the rules validator.** Before, the postmortem improvement cycle (`postmortem_improve.apply_improvement`, `add_prevention_rule`) wrote "Category 'X' has N findings across tasks" advisories with no `rule_id`, `enforcement` or `params`, so `rules_engine validate` rejected the registry. They now get a deterministic `rule_id` (the same scheme as postmortem-merged rules), `enforcement: review-checklist` and empty `params`. The write takes the `prevention-rules.json.lock` lock the postmortem merge uses, and keeps the file's other top-level keys.
+- **A path segment matching a variable name no longer blocks Bash write substitution.** The pre-tool-use hook treated any bare occurrence of an assigned name as a possible rewrite of it. In `T=/var/folders/…/T/pytest-…; echo x > "$T/_scratch/f"`, the `/T/` path component of the macOS temp dir counted as one, so `$T` stayed unsubstituted and the write was denied as `unresolved_shell_variable`. A name directly after `/` is now treated as a path component.
+
+---
+
+## [7.7.0] - 2026-10-31
+### Changed
+- **A re-audit runs one escalation-model spawn per ensemble auditor.** After a repair cycle, ensemble auditors (security, db-schema, threat-model, supply-chain) used to rerun the whole cascade: a fast-tier spawn, then a balanced-tier one if it was clean or an escalation-model one if it found something blocking. That was at least two spawns in sequence for every re-audit (`security-auditor` is re-audited on every cycle), and a clean fast-plus-balanced run could pass a repair of a finding the escalation tier had raised without that tier ever seeing the fix. While `repair-log.json` exists, `lib_ensemble.ensemble_next` now evaluates ensemble auditors with `evaluate_reaudit`. The re-audit is a single spawn at the escalation model, and its verdict is binding, so the first audit's voting-tier reports are superseded. `audit-inject-prompt` and `audit-receipt` refuse the fast and balanced tiers during a re-audit. `audit-receipt` stamps the escalation shard receipt with the `repair_cycle`, and that stamp marks the re-audit done for the current cycle. `run-audit-reaudit-plan` returns a `spawns` map with the exact `model` (and `shard_step_name` for ensemble auditors) for each re-audited auditor. `ensemble-next` reports `reaudit_model`, `reaudit_cycle` and `reaudit_done`. Unchanged: first audits run the same cascade. An ensemble auditor left out of the re-audit set keeps its first-audit verdict, so the DONE gate does not require a re-audit spawn for it. A first-audit cascade left incomplete is finished by the single re-audit spawn. Auditors with no escalation model above the voting tiers keep the normal cascade.
+
+---
+
+## [7.6.1] - 2026-10-31
+### Fixed
+Fixes from the 7.6.0 field report (task T19b).
+- **DONE refuses a broken receipt chain, and rewritten receipts no longer break it.** Every receipt write appends a chain entry, but `validate_chain` compared every entry with the file's current bytes, so a receipt written three times (for example `planner-plan.json` after two plan-audit round trips) failed with `content_mismatch` on the older entries. The current file is now compared only with the newest entry for its path; older entries stay in the signed chain, and a rewrite that bypasses the writer is still caught. `manifest.json` is treated as mutable state. The CHECKPOINT_AUDIT/FINAL_AUDIT → DONE gate (and so `run-audit-finish`) now refuses on `content_mismatch`, `chain_corrupt` or `chain_truncated`, and forced DONEs report it as a bypassed gate. Tasks without a chain are still accepted.
+- **Re-audits keep attempt 1's receipts and prompt sidecars.** Before overwriting a receipt with different content, `write_receipt` archives the previous version to `receipts/_superseded/{step}.v{n}.json`; injected-prompt sidecars keep their previous `.txt`/`.sha256` pair the same way. Audit receipts record `audit_attempt`. Receipt names are unchanged.
+- **Prevention rules are pinned at task start.** `run-start-init` stores the rules in a `receipts/rules-snapshot.json` receipt (older tasks pin on their first rules check), and the rules check, the rules-drift gate and `waive-rule` use the pinned set. A rule another worktree's postmortem adds mid-task no longer refuses DONE with "rules drift".
+- **A task's rules check looks only at the files the task changed.** `run-rules-check` gets a `diff` mode and a new default, `task` (formerly `staged`), which runs `diff` against the task snapshot when one exists and `all` otherwise. Per-file templates examine only changed and untracked files, so a rule matching pre-existing code the task never touched no longer needs a waiver. Repo-wide templates still count across the repo but report only when the task's change is responsible: `signature_lock` and `every_name_in_X_satisfies_Y` when their source module changed, `caller_count_required` when the task lowered the caller count below its minimum. The receipt records the mode used, the requested mode, the diff base and any fallback reason. `--mode all` remains for whole-repo scans.
+- **Bash commands that write through an interpreter are checked.** The pre-tool-use hook only saw redirects and `tee`/`cp`/`mv`-style verbs, and dropped heredoc bodies. It now also extracts literal write targets from `python -c`, `node -e`, `perl -e`, `ruby -e`, interpreter and shell heredocs, `sed -i`/`perl -i`/`ruby -i` and `dd of=`, and runs them through the same policy as `Write`/`Edit`. README and `docs/write-boundary-spec.md` now say plainly that Bash checking is best effort: paths computed at run time, script files and subprocess calls are not seen.
+- **DONE refuses changes outside the task's planned files.** As a backstop for writes the hook cannot see, the DONE gate compares files changed since the task snapshot (committed, uncommitted, deleted and untracked, excluding `.dynos/`) with every segment's `files_expected` and `files_optional`, every repair cycle's files, the TDD receipt's test files, and acknowledged files. Unexplained changes refuse DONE with the file list; forced DONEs report the bypassed gate. `run-execution-segment-done` and `run-audit-findings-gate` report `out_of_scope_files` early. `ctl acknowledge-out-of-scope <task_dir> --file <path> --reason "..."` records a human acknowledgment in the ctl-owned `write-scope.json`. `record-snapshot` now stores a digest of files already dirty at snapshot time so in-progress user edits are not blamed on the task; tasks snapshotted before this change are reported but not refused.
+- **Fewer false `unresolved_shell_variable` denials.** A literal `$` elsewhere in the command (`awk '{print $1}'`), `set -euo pipefail`, `command -v` and a bare `.` argument no longer turn off substitution of variables assigned earlier in the same command. The denial explains that variables from an earlier Bash call are not visible.
+- **Auditor role stamps are released when audits return.** The spawn hook cleared only the planning stamp, so an `audit-*` role stayed active and blocked the orchestrator's next write. Audit stamps are now released when the last spawn of that role returns (also on SubagentStop), and `audit-receipt`, `run-audit-findings-gate` and `run-audit-finish` drop audit stamps with no running spawn. The audit skill runs `ctl clear-role` after the audit batch and after each repair batch.
+- **The postmortem prompt uses the findings gate's view of the audit.** `postmortem_analysis build-prompt` listed every report's findings, including haiku-tier findings a binding deep-tier verdict had overruled and accepted findings, as blocking. It now uses `collect_repair_findings`, lists superseded reports separately, and renders the repair log from the real `repair-log.json` fields (`assigned_executor`, `model_override`, top-level `repair_cycle`), deriving each task's status from whether its finding is still binding. The log no longer reads `-> ? status=? route=generic`.
+- **`quality_score` counts only binding findings.** `compute_reward` and the pre-repair blocking snapshot counted findings from superseded attempts and overruled tiers, so a task whose gate was clear scored 0.0 and raised `low_quality`. Such a task now scores 0.9. Retrospectives now carry `reward_scoring_version`. `postmortem generate` first recomputes older retrospectives whose task directory still has its audit reports, updating the worktree copy, the receipt chain and the persisted copy (`python3 hooks/postmortem.py rescore [--task-id ID] [--dry-run]` does the same in bulk). An older 0.0 that cannot be recomputed on a DONE task is marked unverified and no longer raises `low_quality`.
+- **The postmortem sees every repair cycle.** `repair-log.json` was overwritten each cycle. Each cycle is now also kept in the ctl-owned `repair-log-history.json`, and `build-prompt` renders all cycles in order, marking a finding re-raised and repaired again in a later cycle. Cycles from before this change are reconstructed from `repair-cycle-plan.json` with their auditors only.
+- **The API Contracts gap check keeps the first segment of relative routes.** Cell paths were matched only from a leading `/`, so `companies/{company_id}` was checked as `/{company_id}` and could never match. Relative cells are now prefixed with `/` intact, and full URLs drop their scheme and host. Django REST framework routers (`router.register`, nested routers, routers imported from another module) mounted through `include()` are now discovered.
+- **Gap-check misses after approval no longer force another approval.** At PLAN_AUDIT, when the `plan-validated` receipt still matches spec, plan and graph, API Contracts and Data Model misses (repo-scan checks prone to false negatives) are recorded as warnings in the ctl-owned `plan-audit-gap-warnings.json` and the `plan-audit-check` receipt instead of sending the task back to PLANNING. A plan changed since validation still blocks. The execute and audit skills hand the warnings to the segment executor and to the plan and spec-completion auditors.
+- **`run-start-classification` explains the risk floor.** It now prints `risk_floor_level` and `risk_floor_reason`, so `risk_floor_applied: false` next to non-empty `risk_floor_signals` reads as "planner risk is already at or above the floor".
+- **A planned file that may not change can be marked optional.** Execution-graph segments accept `files_optional` (a subset of `files_expected`). `run-execution-segment-done` reports an unchanged optional file as `optional_unchanged` instead of refusing the segment; required files are still enforced, and an explicit `--files` list gets no relief.
+- **Injected executor prompts have a size budget.** `build_prompt_context` file preloads default to 48 KB (`--max-bytes` or `DYNOS_PROMPT_CONTEXT_MAX_BYTES` to change), with one file capped at half the budget. Files past the budget become a head excerpt with the real line count, then a "Read on demand" path list, and the budget used is recorded in the output and sidecar.
+- **Testing segments already written by the TDD step are finalized without a spawn.** When `tdd_required` is set and the `tdd-tests` receipt still matches `evidence/tdd-tests.md`, a `testing-executor` segment whose `files_expected` are all in the TDD file list and on disk gets an `executor-{seg}` receipt (`tdd_covered: true`). This runs from `run-execution-batch-plan`, `run-execution-segment-done` and `next-continuation`, and batch-plan lists them under `tdd_covered_segments`.
+- **Auditor turn limits match their advertised budgets.** Auditors had `maxTurns: 20` while deep-tier prompts advertised about 25 tool calls. All auditors now have `maxTurns: 30`, the advertised budgets are 18/24/28, and the prompts say to write each finding as soon as it is confirmed. `testing-executor` goes from 60 to 80 turns and must keep its ledger from the first calls. `run-audit-findings-gate` lists reports left at `status: partial` under `incomplete_audits`, and the audit skill re-spawns such an auditor once.
+- **Missing verification evidence no longer stalls a task.** `next-continuation` counted missing or stale verification evidence as incomplete work and raised `stall_count` on every call, while the execute skill ran verification only after `complete`. A segment blocked only by verification evidence now does not stall, `next-continuation` returns `verification_needed` with the segments and next action, and `run-execution-segment-done` reports `verification_pending`. The verification timeout default can be set with `verification_timeout_s` in the project `policy.json`, and the execute skill runs long verification in the background.
+
+---
+
+## [7.6.0] - 2026-10-30
+### Added
+- **`ctl accept-finding` records a human decision to accept an audit finding instead of running another repair cycle.** `ctl accept-finding <task_dir> --auditor <name> --finding-id <id> --reason "..." [--decision-ref <ref>]` writes the ctl-owned `accepted-findings.json` (agents cannot write it). Accepted findings, and re-audit variants from the same auditor with the same category and file, stop blocking the findings gate, the repair plan and the retry caps. The gate and `audit-summary.json` list them under `accepted_findings`.
+- **Re-audits see what happened last cycle.** When `repair-log.json` exists, the auditor prompt lists that auditor's previous findings, what the repair did for each, and any accepted findings. It tells the auditor to report a whole issue class as one finding and to re-raise a repaired finding only when the fix is wrong. On re-audits, the "name the untested surface" line that pushed auditors toward new findings on every pass is replaced by a re-audit focus line.
+- **A `verify_commands` entry can declare its own `timeout`** in seconds.
+
+### Fixed
+- **Clearing one parallel segment's role no longer revokes the executors still running.** Under Claude Code, subagents share the orchestrator's session, so every tool call takes its role from `active-segment-role`. Each spawn overwrote that file, and `ctl clear-role` deleted it after the first segment returned, so the other executors' writes were evaluated as `orchestrator` and denied. The file now holds one role per line. A spawn keeps the roles of siblings still in flight (per `spawn-log.jsonl`), and `clear-role` drops only roles with no running spawn, keeping their grants too. `--role X` drops one role and `--all` restores the old behaviour. A write is allowed when any active role allows it, because the hook cannot tell which running subagent made the call.
+- **Repair routing follows the files being repaired and the finding's severity.** Each repair task's executor is limited to those that fit its files, so a blocking `.tsx` defect from code-quality-auditor goes to ui-executor, not refactor-executor. The file domain is part of the Q-learning state, so routing learned on unrelated files no longer steers it. Blocking findings are routed deterministically with no random exploration, and critical, high, major or blocking findings never run on the fast tier. Merged repair tasks are routed on the union of their files and the cluster's highest severity instead of inheriting the lead finding's executor and model. `run-repair-log-build` reports `merged_finding_ids`, so merged findings are not mistaken for dropped ones. Findings without a cited file are no longer scoped to paths that appear only in their evidence text.
+- **Plan gap analysis no longer reports existing Django endpoints and models as missing**, which had been sending tasks back to PLANNING.
+  - URL resolution follows `include()` of variables, imported lists, `(patterns, app_name)` tuples and inline lists, so each URL list gets the prefix it is actually mounted under.
+  - Endpoint claims written relative to their mount point match the full route on segment boundaries, and "`/a` / `/b`" cells no longer produce a bogus `/` claim.
+  - The Data Model check recognizes Django default table names (`<app>_<model>`) and models built on `AbstractUser` or declared only through `Meta` and fields. It reads the model name from the start of the cell, supports an `existing-modified` marker, and exempts every row for a model declared `to-be-created`.
+  - When the repo scan hits its 2,000-file cap, the report says so (`scan_truncated`, `warnings`), and claims it could not find are listed as `unverified_inconclusive` instead of failing the plan.
+- **Single-auditor re-audits no longer loop indefinitely.** A reworded variant of a repaired finding (same auditor, class and file) inherits its retry count. `run-repair-retry` returns `escalation_required` once one auditor has driven 3 repair cycles; set `max_repair_cycles_per_auditor` in `policy.json` to change the cap. `repair-cycle-plan.json`, which holds that history, can now be written only by ctl.
+- **A clear re-audit after repairs can finish the task.** `run-audit-findings-gate` moves a task from `REPAIR_EXECUTION` back to `CHECKPOINT_AUDIT` when it reports `clear` (`transitioned_to`, or `transition_error` when the stage gate refuses). `run-audit-finish` does the same before checking the stage. Before this, it refused with "unexpected stage for audit finish: REPAIR_EXECUTION" and needed a manual `ctl transition`.
+- **`run-audit-finish` refuses a stale audit summary.** It copies `audit-summary.json` into `completion.json`, so a summary written before the final re-audit could still report FAILED. It now refuses when any audit report is newer than the summary.
+- **Verification commands get an hour by default.** `run-verification-evidence` killed each `verify_commands` entry after 300 seconds, so full-stack e2e suites always recorded `timed_out`. The default now matches `run-tests` (3600 s). A command's own `timeout` wins, then `--timeout`, and each record carries its `timeout_s`.
+- **`/dynos-work:investigate` dossiers contain the code a bug report names.** Triage mints an `F-*` entry for each mentioned file (size, line count, numbered head) and for each `file.py:123` / `file.py:120-140` reference. A new `SY-*` kind holds the bounded source of every named function, class or constant it can resolve. Junk tokens no longer become evidence, linter and Semgrep findings are limited to the mentioned files, and blame is stored as ranges. On a real 8-file report the dossier went from 4.5 MB with no citable code to 0.94 MB with 22 symbol definitions.
+- **The amendment-window refusal names the limit's source and the policy file to raise it in.**
+
+---
+
+## [7.5.34] - 2026-10-29
+### Fixed
+- **The completion summary no longer reports a failure the findings gate cleared.** `run-audit-summary` and `derive_user_summary` added up `blocking_count` across every report file, including attempts a re-audit after repair had replaced and voting-tier reports a binding deep-tier cascade verdict had overruled. On a field task the gate returned `clear` and the task reached DONE, yet `completion.json::user_summary` read "FAILED — 20 blocking findings" with five auditors marked FAIL. `run-audit-summary` now builds its totals from `collect_repair_findings`, the same selection the gate uses. Superseded reports stay in `reports` with their `superseded_by` reason and raw counts, but `total_findings`, `total_blocking`, `audit_result`, `findings_by_auditor` and `findings_by_category` count only binding findings, and a new `blocking_by_auditor` field carries the gate's deduplicated per-auditor counts. `derive_user_summary` skips superseded reports and uses `blocking_by_auditor` when it is present, so the header and per-auditor lines match `run-audit-findings-gate`. Summaries written before this change derive exactly as before, so `verify-audit-summary-text` still matches them.
+- **Residual ingestion at DONE skips superseded reports.** `lib_residuals.ingest_findings` read every report listed in the summary, so non-blocking findings from replaced attempts and overruled voting tiers could enter the proactive-residual queue.
+
+---
+
+## [7.5.33] - 2026-10-28
+### Fixed
+- **A blocking finding about a segment's evidence write-up becomes a repair task instead of failing the task.** `run-repair-log-build` treated every path under `.dynos/` as pipeline-owned. A finding citing `.dynos/task-…/evidence/seg-11b.md` (for example, an evidence claim that a later test run contradicts) therefore returned `escalation_required`, and the audit skill moved the whole task to `FAILED`. `write_policy` lets executors write `evidence/` everywhere except `evidence/verification/`. The repair-path classifier and `write_policy` now call one shared predicate, `write_policy.is_executor_evidence`. A finding that cites the current task's evidence by repo path (`.dynos/task-X/evidence/seg-1.md`) or by task-relative path (`evidence/seg-1.md`) is assigned to an executor, with the repo path in `files_to_modify`. Machine-captured `evidence/verification/` files and other tasks' evidence still escalate.
+- **Repair findings that edit the same file become one repair task.** The builder used to create one task per finding and serialize any that shared a file. One field task produced 22 tasks in 12 batches, and nine executors edited `frontend/e2e/helpers/app.ts` one after another for a single root cause. Tasks whose files overlap, directly or through a chain of overlaps, now merge into one task. The highest-severity finding leads, the others go into `merged_findings` with their instructions appended, the file lists are combined, and the retry count is the highest of the group.
+- **A finding that cites no file no longer gets the whole execution graph as its scope.** When neither the citation nor the prose names a file, the fallback first uses the segments whose `criteria_ids` deliver the criteria the prose names ("AC 3", "criterion 3"), then the assigned executor's segments, then every segment. These tasks are marked `files_inferred`, are not merged with cited tasks, and run in their own batch after the others.
+- **Run-based acceptance criteria get machine evidence.** The planner now declares `verify_commands` (with `criteria_ids`) for every criterion proven by running a command. The execute skill runs `ctl run-verification-evidence` before `run-execution-finish`. The spec-completion auditor also accepts `test-results.json` from `ctl run-tests` as machine evidence. Before this, nothing asked for either record, yet the auditor reported their absence as blocking.
+- **Plan gap analysis finds existing models.** The repo walk skips virtualenvs, both by name (the audit-scope skip list now includes `.venv`, `venv`, `.tox` and others) and by `pyvenv.cfg` marker. Before, `backend/.venv` used up the 2,000-file budget, so models such as `Organization` were reported "not found". Data Model cells are read as their first identifier, so `` `Organization` (existing, app/models.py) `` and `models.Membership` match. SQLAlchemy `__tablename__` and Django `db_table` names count as models.
+- **Each planner spawn gets its own rewrite allowance.** The `plan.md` rewrite cap counted per phase, so a second repair spawn inherited the first spawn's exhausted 6/6 and could not write at all. `ctl set-planner-phase`, which runs before every planner spawn, now resets the counts. The start skill now says to call it before every repair spawn.
+- **A shared prevention rule that does not apply to a task can be waived.** `ctl waive-rule <task_dir> <rule_id> --reason "…"` records a task-local waiver (`rules-waivers.json`, written only through ctl). The rules check skips waived rules, and the receipt records `waived_rules` and `effective_rules_sha256`. The stage gate's drift check compares that digest, computed over the live rules minus the waivers in canonical form. Editing, removing or restoring a waived rule, or reordering the shared file, is therefore not drift, but a new rule still is. Receipts written before this change keep the file-hash comparison. Before, a rule another branch added for a symbol this branch lacks blocked the task, and removing and restoring it tripped the drift gate.
+- **`--tokens-used None` is accepted.** The execute skill passes `None` when an Agent result has no token count, and argparse rejected it. Every `--tokens-used` flag now reads `None`, `null`, `unknown` or an empty value as 0.
+
+---
+
+## [7.5.32] - 2026-10-28
+### Fixed
+- **A re-audit whose cascade passes no longer stays blocked by the previous deep-tier report.** A re-audit restarts an ensemble cascade at the fast tier. When the voting tiers come back clean, the deep tier never runs. The deep-tier report from the earlier attempt was still binding, so findings that had already been fixed kept the gate at `repair_required` until the retry cap. `collect_repair_findings` now supersedes an auditor's deep-tier reports from attempts older than its current fast-tier attempt when the cascade verdict is `pass` (`superseded_by: "cascade pass at attempt-N: <model> did not run"`). A deep-tier report from the current attempt still binds (fail-closed).
+- **One defect reported by many auditors becomes one repair task.** Findings at the same file and line now merge whatever category each auditor gave them. Before, one fix at `pagination.py:81`, reported under twelve IDs, was queued as about ten tasks across nine serial batches and six executor types. Without a line number, findings still merge only when the category matches. The next cycle plan carries the retry count over to every merged finding, and `run-audit-reaudit-plan` re-spawns the merged findings' auditors.
+- **Repair tasks get the right files.**
+  - Parenthetical notes are removed from citations before they are split, so `x.py:81, :103-104 (guard, …)` no longer yields a junk path like `:103-104 (DB-eval guard …)`. Fragments that are not path-shaped are dropped. Line forms `:L81` and `:81-83` are stripped.
+  - A partial path such as `revision.py` resolves to the single repo or planned file that ends with it. Two spellings of one file therefore can no longer land in the same parallel batch.
+  - A finding that cites no file is now scoped to the files its title, description, evidence or recommendation names, when those files exist. Before, it fell back straight to its executor's segment files: every file in the task, or files that did not include the file to fix.
+- **Plan audit accepts new endpoints and Django routes.** `analyze_api_contracts` now:
+  - exempts API Contracts rows marked `to-be-created` in any cell (reported under `to_be_created`), as the Data Model check already did;
+  - treats a cell that names several paths as several endpoints;
+  - resolves Django `path()` routes through the `include("pkg.urls")` prefixes that mount them, and normalizes `<int:pk>` params. A relative route whose module nothing includes matches a claimed endpoint by suffix.
+- **claude-md-auditor no longer blocks on a missing `PLUGIN_HOOKS`.** It looks for `lib_claude_md.py` under `PLUGIN_HOOKS`, the path in the spawn prompt, `CODEX_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT`. If none of them has it, it reports a non-blocking `infrastructure` finding instead of a blocking critical `tool-error` that no repair could clear. The audit skill now puts `PLUGIN_HOOKS=<plugin-root>/hooks` in every auditor spawn prompt.
+- **The pipeline skills' command funnel works without `CLAUDE_PLUGIN_ROOT`.** When both plugin-root variables are unset, start, plan, execute and audit now resolve the plugin root from the skill's base directory instead of exiting 2.
+
+## [7.5.31] - 2026-10-28
+### Fixed
+- Findings that say `"severity": "blocking"` without the boolean `blocking` flag now block. Release-auditor and spec-completion-auditor reports were seen omitting the flag. Every counter read `bool(finding.get("blocking"))`, so those findings were treated as non-blocking and the audit could pass over them. The new `lib_core.finding_is_blocking` is now the single rule for the audit receipt's `blocking_count`, the findings gate, the repair cycle plan, `collect_repair_findings`, `run-audit-summary`, the audit-summary validator and the DONE gate's open-finding check. An explicit boolean `blocking` decides. When it is missing, a `blocking` or `critical` severity counts as blocking (fail-closed). `normalize_repair_severity` maps `blocking`/`non-blocking` to `high`/`low`.
+- A finding whose `file` lists several paths (`".gitignore, infra/docker-compose.yml"`, `"client.ts:7; status.tsx:28"`) now gets one `files_to_modify` entry per path, with line suffixes stripped, instead of one path that names no file.
+
+## [7.5.30] - 2026-10-28
+### Fixed
+- **A plan repaired after approval is approved again.** `run-plan-audit` runs at `PLAN_AUDIT`, after the human approved `plan.md` at `PLAN_REVIEW`. On `replan_required` the skills had the planner repair `plan.md` in place, so `run-execute-setup` later refused with "plan.md was mutated after human approval". `run-plan-audit` now moves the task back to `PLANNING` itself (`transitioned_to`, `next_action: repair_plan_then_reapprove`). The start and plan skills route the repaired plan through validation, the `PLAN_REVIEW` transition and human review before the audit reruns.
+- **`approve-stage` refuses before writing anything when the task is not at the stage being approved.** It used to write the approval receipt first and only then fail the transition. Approving `PLAN_REVIEW` from `PRE_EXECUTION_SNAPSHOT` therefore re-signed whatever `plan.md` said at that moment, then printed `Illegal stage transition: PRE_EXECUTION_SNAPSHOT -> PLAN_AUDIT`.
+- **The execute skill runs its ctl commands in an order the stage gates accept.**
+  - It runs `ctl run-rules-check --mode all` before `run-execution-finish`. Finish requires the `rules-check-passed` receipt, and no skill ran the check. `all` is used because execution never stages files, so the default `staged` mode would pass without checking anything.
+  - The evidence re-check (`run-execution-verify-evidence`) moves to right after `run-execution-finish`. It accepts only `EXECUTION`/`TEST_EXECUTION`, and Step 4's `run-tests` advances the task to `CHECKPOINT_AUDIT`, so the old Step 5 always failed.
+  - The inline fast-track path now finalizes its segment and runs the end of Step 3 before the tests. It used to go straight to `run-tests`, which refuses a task still at `EXECUTION`.
+- **`ctl log-append` accepts the tags the skills record:** `VOTE`, `REPAIR`, `VISION`, `INLINE` and `CACHE`. It refused `[VOTE]`, which the audit skill asks for on every ensemble spawn. Those skill lines now use `log-append`, and `test_skill_log_append.py` rejects the hand-written form.
+- **Untracked tool caches stay out of audit scope.** Since 7.5.28, `git_changed_files` added every untracked file, so a repo that does not gitignore its caches put 11,364 `frontend/.pnpm-store` and `celerybeat-schedule*` files (57MB of setup output) into one task's scope. The helper now:
+  - skips untracked paths under cache and build directories (`node_modules`, `.pnpm-store`, `.venv`, `.cache`, `__pycache__`, `dist`, `build`, `target`, …), `celerybeat-schedule*`, `*.pyc`/`*.log` and binary files;
+  - includes no untracked files when more than 500 remain after filtering.
+
+  `run-audit-setup` reports `untracked_skipped`, plus an `untracked_warning` telling the user to gitignore or `git add`. Tracked changes are never filtered.
+- **`record-snapshot` on a repository with no commits** now says to create an initial commit, instead of failing with `cannot auto-detect HEAD SHA`. The execute skill creates its snapshot branch with `git branch dynos/task-{id}-snapshot`. The old `git checkout -b … && git checkout -` renamed the unborn branch and then failed.
+- **The audit skill's `audit-receipt` example passes an absolute `--report-path`** (`"$PWD/.dynos/…"`) and says to reuse the exact path given to the auditor. The receipt compares it with the envelope's absolute `report_path` as exact strings, so the relative example was always refused.
+
+## [7.5.29] - 2026-10-28
+### Fixed
+- `ctl run-repair-log-build` no longer writes a repair log that fails its own validation when ensemble auditors escalate. The findings gate, the repair-cycle plan, the builder and `validate_repair_log` each derived "the findings" on their own. The first three took every blocking finding from every report, so an ID reused by the fast tier and the deep tier (`SC-1` in both `supply-chain-auditor-haiku-attempt-1.json` and `…-fable-attempt-1.json`) was queued twice with the fast tier's severity. The validator kept whichever copy sorted first by filename, and its location dedup dropped findings the builder kept. The result was `duplicate finding_id`, `severity mismatch` and `not found in live audit reports`, identically on every re-run, with no supported way past `REPAIR_PLANNING`. All four now read one function, `lib_validate.collect_repair_findings`:
+  - **The deep tier's verdict is binding.** When an ensemble cascade's verdict is `escalated` (as `ctl ensemble-next` reports it), the voting-tier reports are superseded. A deep tier that ruled nothing blocking now clears the fast tier's blocking findings instead of queuing them for repair. This fails closed: if the escalation tier wrote no report, or the cascade is incomplete or has gaps, nothing is superseded.
+  - **The latest attempt of a shard is binding.** A later `-attempt-N` report of the same auditor and model supersedes earlier ones, so findings repaired in a previous cycle are not re-queued next to the re-audit's findings with the same IDs.
+  - **Findings are keyed by `(auditor, id)`.** The same ID from two auditors stays two findings, and the validator accepts both. A task without an `auditor` resolves only when exactly one auditor reported its ID.
+  - **Duplicate reports of one defect are merged.** A finding at the same file, line and category as an earlier one becomes part of it (`_merged`; the repair instruction names every merged ID). Blocking findings are visited first, so a non-blocking duplicate can no longer shadow a blocking one. A finding with no file is never merged; before, a shared category alone could drop it.
+  - Severity comes from the binding report, normalized once (`major`→`high`, `minor`→`low`) by the new `normalize_repair_severity`, which the validator also uses. Reports superseded by either rule are listed in the gate and plan output with `superseded_by`.
+- Repair tasks target the files the finding names, and never pipeline state:
+  - **Files come from the finding.** The builder read only `file` and `evidence.file`, but the canonical report schema puts a finding's location in `location: "file:line"`. Every schema-conformant finding therefore fell back to all of its executor's graph files, or to every file in the graph (a 64-file repair task). The builder now reads `location`, the older forms, and the auditor's own `repair_tasks[].affected_files` and `assigned_executor`.
+  - **Pipeline paths are excluded.** Paths under `.dynos/`, and task-dir artifacts such as `receipts/…` or `events.jsonl`, are never repair targets: `write_policy` lets executors write only repo files and `evidence/*.md`, so such a task could only fail. A blocking finding that names only pipeline artifacts makes the build return `escalation_required` (`next_action: write_escalation_and_fail`, with `non_repairable_findings`) instead of assigning an executor to rewrite receipts. The audit skill documents that outcome.
+- Repair executors fit the finding. `lib_qlearn` derived a finding's category from its ID prefix, case-sensitively, while the action-space keys are lowercase. `SC-1`, `INFRA-01` and `PI-…` therefore matched no category and fell through to every executor, and an unseen state picked one at random (`data-executor` on a receipt, `ml-executor` on `events.jsonl`). The category now comes from the reporting auditor when known (supply-chain → infra, test-strategy → testing-executor, docs-accuracy → docs-executor, …) and otherwise from the lowercased prefix. `run-repair-q-update` uses the same category, so learned states line up.
+- Q-learning now sees the finding's auditor. The cycle plan stores it as `_auditor` but `build_repair_plan` read `auditor`, so the security-finding deep-tier model floor never applied. Security repair tasks now get the deep tier as intended.
+- A rejected `run-repair-log-build` no longer leaves its invalid `repair-log.json` behind. The next cycle plan read that file as a completed cycle and bumped every retry count. The previous log, or no log, is restored. A cycle plan whose findings are no longer in the binding reports makes the build refuse with a message to re-run `run-audit-repair-cycle-plan`.
+- `run-repair-q-update` judges "still blocking" from the binding reports only, so a superseded copy of a repaired finding no longer counts as unresolved.
+
+## [7.5.28] - 2026-10-20
+### Fixed
+- A failing test run no longer strands the task in `REPAIR_PLANNING`. Execute used to move a test failure from `TEST_EXECUTION` to `REPAIR_PLANNING`. The only ways out of that stage are `REPAIR_EXECUTION`, which needs a repair log whose batches cite audit-report findings (none exist before the audit runs), and `FAILED`. So `write-repair-log` refused with `repair log must contain at least one batch`, `run-audit-setup` refused the stage, and the task could only be failed or forced. Now:
+  - The new `ctl run-tests <task_dir> --command ... [--command ...]` runs the test suites itself, uses their exit codes as the verdict, writes the control-plane file `test-results.json` (with output tails), and advances `TEST_EXECUTION → CHECKPOINT_AUDIT` whether the tests passed or failed.
+  - When the recorded run failed, `router.py audit-inject-prompt` adds a `## Known Failing Tests` block to the `spec-completion-auditor` prompt, so the failure comes back as a blocking finding and goes through the normal repair loop.
+  - The DONE gate refuses while `test-results.json` does not say `passed`. The audit skill re-runs `ctl run-tests` after repair batches.
+  - The `TEST_EXECUTION → REPAIR_PLANNING` edge is removed from `ALLOWED_STAGE_TRANSITIONS`.
+- New, untracked files are now part of the audit scope. `run-audit-setup`, `run-audit-reaudit-plan` and `router.py audit-plan --diff-base` built `diff_files` from `git diff --name-only <snapshot>` alone, which leaves out untracked files. A task whose work was all new files got `diff_files: []` unless someone ran `git add -N` first. The new shared helper `lib_core.git_changed_files` adds `git ls-files --others --exclude-standard` (skipping untracked `.dynos/` state), and the sharding line count now includes the lines in untracked files.
+
+## [7.5.27] - 2026-10-20
+### Fixed
+- Background planners no longer lose the `planning` role before they run. When Claude Code spawns a subagent in the background, the Agent tool's PostToolUse fires as soon as the subagent launches, with an empty result. `hooks/agent_spawn_log.py` treated that as the planner returning, so it ran `ctl clear-role`. That expired the planning grants within a fraction of a second, and the planner's `spec.md`/`plan.md` writes were denied as `role=orchestrator`. A post row with no result content (or an `async_launched` status) is now recorded as `async_launch` with its `agent_id` and leaves the stamp alone. The SubagentStop hook (`hooks/lib_tokens_hook.py`) now releases the stamp after it writes the planner's `stop` row. Launches are paired with stop rows by `agent_id` and fall back to any spare planning stop row. Foreground planners still clear on post, and parallel worker planners still clear only after the last one has finished.
+
+## [7.5.26] - 2026-10-19
+### Fixed
+- Audit-phase latency. An investigation of 68 tasks across 16 projects found a median of 99 active minutes in the audit phase, 18 auditor spawns per task, auditors accounting for 83% of audit runtime, 276 spawns that never wrote a receipt, and 618 of 1297 audit reports that matched no routed auditor. Five fixes address the measured causes.
+  - **Ensemble scope and escalation.** High and critical risk no longer force every auditor into the ensemble: only the security-class set (security, db-schema, threat-model, supply-chain) always runs it, and other auditors are sampled in at the existing 20% rate at every risk level. Escalation to the deep tier happens only when a voting-tier shard reports blocking findings; non-blocking findings no longer trigger it. The DONE gate (`_check_ensemble_voting`) and `ctl run-audit-summary` use the same single rule, `lib_ensemble._needs_escalation`, which reads `blocking_count` and fails closed to the total finding count when `blocking_count` is absent or is not a non-negative integer (a bool, string or float is not trusted).
+  - **Bash write destinations.** A Bash command that assigns a shell variable and then writes to `$VAR/...` in the same command now has the literal variable expansion resolved before the write policy checks the destination. Substitution is disabled for the whole command when it uses a builtin that can set a variable by a computed name (`declare`, `typeset`, `local`, `readonly`, `read`, `mapfile`, `readarray`, `let`, `getopts`, `printf -v`, `unset`, `set`, `builtin`, `command`) or ANSI-C, locale or indirect expansion (`$'..'`, `$".."`, `${!x}`), so the hook can never approve a decoy path. Inside a dynos task, any residual `$` in a destination is denied fail-closed with a `pre_tool_use_bash_check` event, and the denial prints the literal path to use; the task is inferred from the variable path's literal prefix when nothing else resolves it. Outside a task, `$HOME`/`$TMPDIR`/`$(mktemp)` destinations pass through as before. The environment is never consulted.
+  - **Report names.** Report names are normalized onto the routed auditor names, and all 20 auditor agent files now write to `.dynos/task-{id}/audit-reports/{auditor_name}-{model}-attempt-{n}.json`, defined once as `CANONICAL_AUDIT_REPORT_PATH` in `hooks/write_policy.py`. This removes the unmatched-report class.
+  - **Missing-shard gaps.** Every missing-shard gap from the cascade evaluation, and the DONE refusal text, now ends with `expected receipt: receipts/audit-{auditor}-{model}.json (shard_step_name {auditor}-{model})`. The audit skill re-spawns only auditors whose `ensemble-next` status is `spawn`, rather than re-running auditors that already completed.
+  - **Planner role stamp lifetime.** The `planning` role stamp is cleared when the last in-flight planner spawn returns (`lib_core.clear_stamped_role`), so the orchestrator's own `ctl` calls are no longer blocked by the round-two planner Bash guard. Parallel worker planners in hierarchical mode share the stamp, so a returning planner defers the clear (`planning_clear_deferred` on its spawn-log row) while another planner `pre` row from the last two hours has no matching `post`.
+
+## [7.5.25] - 2026-10-19
+### Changed
+- Release hygiene derives the version bump from the PR title's conventional-commit prefix instead of defaulting to patch: `feat:` is minor, `fix:` / `docs:` / `chore:` / `refactor:` / `perf:` / `test:` / `ci:` / `build:` / `style:` / `revert:` are patch, and `feat!:` or `BREAKING CHANGE` is major. `release:*` labels still override. A title without a recognized prefix fails the job, and editing the title re-runs it. `scripts/bump_version.py --bump auto` is the new default, and `--print-bump` prints the resolved bump without writing. CI stamps the resolved `release:*` label on every PR (creating it when missing) so the bump is visible on the PR; `CLAUDE.md` asks authors to pass the label at `gh pr create`.
+
+---
+
+## [7.5.24] - 2026-10-19
+### Changed
+- Pre-execution latency, round two (measured on 22 real tasks: median 143 minutes from task creation to ready-to-execute, 20 of 22 classified high/critical, 0 on the combined path).
+  - **Path selection.** `combined` (one Spec + Plan spawn, one joint review) is now the default. `staged` is reserved for migrations, critical risk, and high risk touching `db`/`security`. `testing` and `docs` never count toward risk floors or path selection, and file count is no longer a risk-floor signal (`_compute_risk_floor` keeps it as telemetry only). The planner's classification rule "more than 10 files = high" is gone.
+  - **Opt-in gates.** `tdd_required` defaults to `false` when the planner leaves it unset (`policy.tdd_default_risk_levels` restores TDD-first per risk level); tests are still written by `testing-executor` during execute. The Architectural Design Doc phase runs only when `manifest.arch_design_required` is true (default: critical; `policy.arch_design_min_risk` widens it). `run-start-classification` prints both flags.
+  - **Artifact ceilings.** `validate_task_artifacts` rejects specs with more than 20 acceptance criteria or 2,500 words and plans over 4,000 words (`policy.max_acceptance_criteria` / `max_spec_words` / `max_plan_words` override). `API Contracts` and `Data Model` are required only when the execution graph's `files_expected` touch a route/controller or migration/model file; `Architecture Decisions` only for critical risk. The planner prompt no longer asks for `N/A` tables or one criterion per UI state.
+  - **Planner turn budget.** `write_policy` enforces `PLANNER_WRITE_TURNS` (6 writes per artifact per phase; a repair phase starts fresh). `pre_tool_use` denies planner Bash calls to validators, gap analysis, plan audit, and stage/approval commands — the orchestrator runs those.
+  - **Plan audit.** `ctl run-plan-audit` is deterministic at every risk level and writes the hash-bound `plan-audit-check` receipt itself; a fresh receipt short-circuits a re-run (`receipt_cached`). The LLM `spec-completion-auditor` pass is opt-in via `policy.plan_audit_llm` (`true` or a list of risk levels).
+  - **Amendment window.** `ctl amend-artifact` refuses a second post-approval amendment of the same artifact (`policy.max_amendments_per_artifact` raises it) and emits `amendment_window_exhausted`.
+  - **Visibility.** New `ctl task-churn <task_dir>` counts planner spawns, approval receipts, amendments, gate refusals, write-policy denials, and planner validator attempts, with warnings; `/dynos-work:status` prints it. `run-planning-mode` persists `planning_mode` on the manifest.
+  - **Timeline.** The SubagentStop hook now appends a `stop` row to `spawn-log.jsonl` with the transcript's first/last timestamps and measured `seconds`. `compute_planning_timeline` prefers those rows; pre/post pairs that are within a second (the Agent tool returns as soon as the spawn starts) are reported as `unmeasured` instead of contributing zero, and `ctl timeline` exits 1 with named errors when `stage-transitions.jsonl` or spawn durations are missing. Receipt log lines print `tokens=hook-recorded` instead of `tokens=0`.
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.24`.
+
+---
+
+## [7.5.23] - 2026-10-19
+### Changed
+- Start planning now supports a one-review combined path, one-pass discovery, subsystem-based hierarchy, bounded artifact repair, and per-phase read quotas. Planner receipts bind to hook-observed spawns; token attribution is recorded once by SubagentStop. Risk floors and external research triggers are narrower, and planning timelines now separate model, approval, orchestrator, and idle time.
+- Release automation now inserts version entries after populated Unreleased notes.
+
+### Fixed
+- The planner read quota is now enforced at runtime. `pre_tool_use` returned early for every non-audit role before consulting `read_policy`, so the new `planning` branch was reachable only from unit tests; the hook now routes planner `Read`/`Grep`/`Glob` calls through `decide_read` with the per-phase allowance.
+- Added `ctl log-append` as the only sanctioned way for skills to write `[GATE]`/`[SKIP]`/`[DONE]`/`[BUDGET-PAUSE]` lines to `execution-log.md`. Automatic role stamping made the orchestrator resolve as the stamped subagent role after the first planner spawn, and that role is denied direct writes to the log, so every hand-written append in the start, execute, and audit skills would have failed. `run-external-solution-gate` now writes its own `[GATE]` line, and the redundant manual `[ADVANCE]` line in Step 9 is gone (`transition_task` already records the stage change).
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.23`.
+
+---
+
+## [7.5.22] - 2026-10-18
+### Changed
+- Re-chain artifacts when recording amendments
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.22`.
+
+---
+
+## [7.5.21] - 2026-10-18
+### Changed
+- Honor to-be-created markers for greenfield Data Model rows
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.21`.
+
+---
+
+## [7.5.20] - 2026-10-18
+### Changed
+- Classification veto writes append the final hash to the task receipt chain;
+  validation accepts superseded artifact hashes while still checking every
+  chain link and HMAC.
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.20`.
+
+---
+
+## [7.5.19] - 2026-09-27
+### Fixed
+- Executor spawns no longer end by being killed at the turn cap. The per-spawn
+  tool budget and the runaway backstop were the same number — `hooks/lib_tool_budget.py`
+  clamps a segment's budget at `TOOL_BUDGET_CEILING = 40`, and every executor's
+  frontmatter declared `maxTurns: 40` — so an executor handed a 38–40-call
+  estimate had no turns left for the work the injected prompt asks of it. Since
+  that prompt (`hooks/router.py`) presents the budget as "an ESTIMATE for
+  scoping — NOT a cap", nothing ended a spawn except the harness kill, which is
+  why every segment of a multi-segment task hit the ceiling regardless of its
+  size. Worse, the kill lands before the executor can write the progress ledger
+  that `ctl next-continuation` resumes from, so the continuation had nothing on
+  disk to continue from and two fruitless rounds tripped the `stalled` halt.
+  Every executor's `maxTurns` is now 60, leaving 20 turns of wrap-up headroom
+  above the unchanged 40-call ceiling. Per-spawn scope is unchanged.
+- Reconciled the executor prompts with the budget block they are spawned with.
+  Eight agents (backend, db, docs, integration, ml, refactor, testing, ui) still
+  carried the superseded instruction "Stop and emit evidence within 3 tool uses
+  of that budget. The agent frontmatter `maxTurns: 40` is the runaway backstop,
+  not the operating budget" — the exact opposite of the injected block, in the
+  same context window. They now describe the budget as an estimate and ask for
+  the resumable progress ledger, matching `router.py`.
+- Bumped the five CLI executor templates that declared the old 40-turn cap, so
+  projects scaffolded from `cli/assets/templates/base/agents/` inherit the
+  headroom rather than the bug.
+
+### Changed
+- The runaway-defense seal (`tests/test_runaway_defense_seal.py`) now enforces
+  the headroom instead of the collision. Its ceiling test previously asserted
+  that "the frontmatter maxTurns=40, validator ceiling=40, and max budget=40
+  must all agree", which locked in the defect above. `TOOL_BUDGET_CEILING` is
+  still pinned at exactly 40; what changed is that each executor must now
+  declare a `maxTurns` exceeding it by at least `MIN_WRAPUP_HEADROOM` (10), and
+  no executor prompt may tell the agent to stop at its budget. A CLI template
+  that declares a cap is held to the same headroom; one that omits it is skipped
+  deliberately, since the packaged CLI that assembles that frontmatter is not in
+  this repo.
+- Corrected the `TOOL_BUDGET_ADVISORY` comment, which claimed the constant was
+  "used by self-pacing prompt instruction". No prompt has used it since the
+  self-pacing cutoff was removed; its only consumer is the non-blocking
+  `near-budget-ceiling` finding at the plan gate.
+
+---
+
+## [7.5.18] - 2026-09-20
+### Fixed
+- The external-solution gate's research validator no longer blocks the spec
+  pipeline outright on hosts that cannot produce the evidence it asks for.
+  Layer (b) of `run-spec-ready` required at least one `WebSearch`/`WebFetch`
+  entry in `web-tool-log.jsonl`, which is written by exactly one thing: the
+  `PostToolUse` hook matching those two tool names. They are Claude Code tool
+  names. Codex researches through its own built-in tooling, which never
+  reaches this plugin's matcher, so the log was never created, the check hit
+  its missing-file branch, and the task could not leave `SPEC_NORMALIZATION`
+  no matter how much real research was performed — with no legitimate
+  workaround, since `write_policy` denies every agent role write access to
+  that file by design. The check is now host-aware:
+  - On a telemetry-capable host — Claude Code, and any host name the plugin
+    does not recognise — behaviour is unchanged: a missing log or an empty
+    window is still a hard block.
+  - On a host known not to emit those events (`codex`), the temporal
+    cross-check falls back to the ordering evidence that does survive: the
+    receipt must not predate `gate.written_at`. The receipt-existence and
+    receipt-structure layers are untouched, so real URLs and a ≥200-char
+    findings summary are still required.
+  - A qualifying log entry passes at full strength on any host, so a harness
+    that starts emitting the events is enforced strictly with no further code
+    change. `hooks/web_tool_log.py` now normalises the spellings other
+    harnesses use (`web_search`, `web_fetch`) to the canonical names.
+  - Degrading is never silent: the gate prints a `[GATE]
+    external-solution-cross-check degraded` line and emits a
+    `web_tool_evidence_degraded` event carrying the host, the provenance of
+    that host signal, and both timestamps.
+
+  This follows the pattern already used for harness telemetry a host cannot
+  emit — `_assert_spawn_log_evidence` degrades with a visibility event when
+  `spawn-log.jsonl` is absent, and `router.py` disables ensemble and
+  escalation with `reason=host_null_mapping` on a host with no model mapping.
+- Closed the bypass that a naive version of the above would have opened.
+  `detect_host()` reads `CODEX_PLUGIN_ROOT` from the environment, which an
+  agent can set in front of a Bash invocation, so the validator resolves the
+  host through the new `lib_host.resolve_host()`: the persisted host in
+  `control-plane.json` (hook-written, denied to every agent role by
+  `write_policy`) wins over env detection, and the provenance of whichever
+  signal answered is recorded in the degrade event.
+- Wired the persisted-host anchor that resolution depends on.
+  `lib_host.persist_host` had zero callers — `tests/test_hostmodel_control_plane.py`
+  documented a `SessionStart` write path that was never implemented, so
+  `get_persisted_host` always returned `None` and every reader
+  (`receipts/stage.py`, `lib_tokens_hook.py`) silently fell back to env.
+  `hooks/session-start` now writes it for both the in-repo
+  `<root>/.dynos/control-plane.json` and the persistent project dir.
+
+---
+
+## [7.5.17] - 2026-09-06
+### Fixed
+- The audit ensemble cascade (fast tier → balanced tier on zero findings →
+  deep tier on any finding) now runs without the operator asking for it.
+  Before, the cascade existed only as prose in the audit skill while the
+  router handed the orchestrator a single `model` per auditor, so every
+  ensemble auditor was spawned once at that model and the cascade was
+  skipped; the DONE gate then accepted a lone deep-tier shard receipt as a
+  completed ensemble. Four deterministic enforcement points replace the
+  prose:
+  - `ctl ensemble-next <task-dir> [auditor]` computes, from the audit plan
+    and the shard receipts on disk, the next required spawn per auditor
+    (`spawn` with the exact model and `shard_step_name`, `complete` with
+    the verdict, or `single` for non-ensemble auditors). The audit skill
+    loops on it until `"complete": true`.
+  - `router.py audit-inject-prompt` refuses to prepare an ensemble auditor
+    at any model other than the next cascade step (the fast tier is always
+    allowed, so a re-audit can restart the cascade).
+  - `ctl audit-receipt --ensemble-context` refuses a shard receipt written
+    out of cascade order, and fails closed when the auditor has no ensemble
+    entry in `audit-plan.json` or the `audit-routing` receipt.
+  - `ctl run-audit-summary` and the DONE gate (`_check_ensemble_voting`)
+    share one evaluation in the new `hooks/lib_ensemble.py`; an escalation
+    receipt without the voting-tier receipts, or a balanced tier skipped
+    after a clean fast tier, is a gap. Later-tier shards older than the
+    current fast-tier shard are treated as stale so repair re-audits start
+    a fresh cascade.
+
+---
+
+## [7.5.16] - 2026-07-27
+### Fixed
+- `CHANGELOG.md` had entries for 7.5.16 and 7.5.17 that no manifest ever
+  carried. All three changes in PR #236 shipped as a single release, 7.5.15 —
+  the Release Hygiene workflow computes one version per PR from the base ref,
+  so hand-written per-change bumps were normalized away while their changelog
+  entries survived as orphans. The three entries are merged into 7.5.15.
+
+### Changed
+- `CLAUDE.md` release hygiene no longer instructs contributors to hand-edit
+  version fields. `.github/workflows/release-hygiene.yml` runs
+  `scripts/bump_version.py` on every PR, which derives the next version from
+  the base ref, writes all four manifests, and pushes a
+  `chore: update release metadata` commit to the PR branch. Following the old
+  instruction produced redundant edits that CI overwrote, a push rejection on
+  the next `git push`, and — when a PR bundled several changes — one changelog
+  entry per change instead of one per release.
+
+---
+
+## [7.5.15] - 2026-07-27
+
+Three independent changes, shipped together.
+
+### Added
+- **Frontier tier.** `TIER_FRONTIER` → `fable` as a fourth rung above `deep`
+  in `lib_models.TIER_TO_MODEL`, plus `TIER_RANK` as the single authority for
+  tier ordering. Codex maps it to `None` like every other tier.
+- **Role tier ceilings** (`lib_models.ROLE_TIER_CEILINGS`,
+  `max_tier_for_role`, `clamp_model_to_role_ceiling`). `router.resolve_model`
+  is now a thin wrapper that clamps the inner selector's result, so no
+  selection path — explicit policy override, epsilon-greedy exploration, UCB
+  winner, benchmark selection, learned history, or default — can put an
+  executor role above `deep`. A clamp emits `router_model_ceiling_clamp` and
+  preserves the pre-clamp pick on `uncapped_model`.
+- Guard test (`tests/test_tier_ceiling_invariant.py`) driving the ceiling
+  through the production `resolve_model` entry point rather than asserting on
+  constants.
+- Guard test (`tests/test_explicit_invocation_only.py`, 160 cases) covering
+  every invocable surface: each skill and command template names its typed
+  command and declares itself never auto-triggered; each agent names the
+  command that spawns it and forbids direct spawning; no description contains
+  auto-trigger phrasing ("use after", "runs automatically", "periodically",
+  "proactively", "whenever"); template mirrors have not drifted; skill names
+  stay bare so the command is singly namespaced; and the SessionStart hook
+  does not reintroduce the standing invocation order.
+- Guard test (`tests/test_import_root_collisions.py`) asserting no two import
+  roots (`hooks/`, `memory/`, `debug-module/`) expose the same top-level
+  module name. Five pre-existing `hooks` <-> `memory` collisions
+  (`agent_generator`, `lib_qlearn`, `postmortem`, `postmortem_analysis`,
+  `postmortem_improve`) are frozen in a documented allowlist — latent rather
+  than active, since `hooks/` wins the path order and nothing needs the
+  `memory/` copy under those names — so a sixth fails the build.
+
+### Changed
+- `planning` default tier moves `balanced` → `frontier`; `agents/planning.md`
+  frontmatter follows. Plan quality sets the cost of every downstream executor
+  spawn, which is where the spend actually is.
+- Ensemble escalation model moves `deep` → `frontier`. Auditors keep their
+  existing default tiers, so a clean first pass never pays frontier rates —
+  only a split between the fast/balanced voting arms spends a frontier spawn.
+- Security floor in `router.resolve_model` and the `security-auditor`
+  monotonicity check in `policy_engine.derive_model_policy` are now rank
+  comparisons. As equality checks against the deep-tier literal, both would
+  have classified a frontier pick as *below* floor and downgraded it.
+- `circuit_breaker._deep_tier_zero_yield_count` counts spawns at the deep tier
+  **or above**, so an auditor escalated to frontier that returns no findings
+  still trips the breaker. The `model=None` identity match under codex is
+  preserved.
+- `tests/test_model_literal_guard.py` regex extended with `fable`; without it
+  the new literal could leak outside `lib_models.py` unnoticed.
+- debug-module's internal package renamed `lib` -> `debuglib` (42 references
+  across 15 files). `hooks/lib.py` is untouched: it is a backwards-compat
+  facade whose whole purpose is that `import lib` keeps working, so it is the
+  wrong side to rename.
+
+### Fixed
+- **dynos-work commands no longer fire without the user typing them.**
+  `/dynos-work:<command>` is the only invocation route; command names are
+  unchanged. The root cause was not the slash namespace (the plugin prefix
+  already supplies that) but the three surfaces that invoke a command
+  *without* a typed one:
+  - **Skill descriptions.** A description is a trigger signal, and these were
+    written as capability advertisements. `resume` said "Use after session
+    restart or context compression", so restarting a session could fire it;
+    `status` matched any question about status; `init` matched project-setup
+    requests; `maintain` advertised that it periodically scans and opens pull
+    requests. All 21 descriptions (and their 20 template mirrors) now state
+    what the command does and scope invocation to the explicit
+    `/dynos-work:<name>` form. `memory` and `execution` keep their legitimate
+    pipeline-invoked route. The `founder` command template, which has no
+    `skills/` counterpart, is covered too.
+  - **Agent prompts.** The same leak one level down: a description like
+    "Implements API routes, services, business logic, and auth" reads as a
+    standing offer, so the model could spawn an executor or auditor
+    spontaneously outside any dynos-work task — a stray executor writes code.
+    All 37 agents in `agents/` and their 34 mirrors under
+    `cli/assets/templates/base/agents/` now name the `/dynos-work:<command>`
+    that spawns them and forbid direct spawning.
+  - **The SessionStart hook.** `hooks/session-start` injected "Use dynos-work
+    start for new tasks." into every session — a standing instruction to enter
+    the pipeline whenever a request looked task-shaped. It now states that
+    commands are user-invoked only and that the pipeline must never be entered
+    on the agent's own initiative.
+- **`pytest tests/ debug-module/tests/` in a single process.** 124
+  debug-module tests were erroring with `ImportError: cannot import name ...
+  from 'lib'`. The cause was a top-level module name collision, not test
+  pollution: `hooks/lib.py` (a re-export facade) and `debug-module/lib/` (a
+  package) shared the name `lib`. Both roots land on `sys.path` during a
+  combined run, and Python caches by name rather than by path — so once any
+  `tests/` case imported `lib`, `sys.modules["lib"]` was pinned to the facade
+  and every debug-module `from lib import <step>` resolved against the wrong
+  module. Either suite alone was unaffected, which is why it went unnoticed.
+
+---
+
+## [7.5.14] - 2026-07-15
+### Added
+- Guard test (`tests/test_domain_registry_invariant.py`) asserting
+  `lib_core.VALID_DOMAINS` and the `domain_conditional` keys in
+  `router._DEFAULT_AUDITOR_REGISTRY` stay a set-equal, closed vocabulary.
+  `build_audit_plan` selects domain-scoped auditors via `dict.get(domain, [])`,
+  so a domain present in one but not the other silently drifts: a new valid
+  domain would run only the `always` roster, and a typo'd registry key would be
+  a dead entry that never fires. The test fails on either drift and documents
+  that an intentionally `always`-covered domain must carry an explicit
+  empty-list entry rather than be omitted.
+
+---
+
+## [7.5.13] - 2026-07-15
+### Changed
+- Re-based the spawn-budget backstop off clean-audit counting. "Wasted spawns"
+  previously meant *empty-findings audit reports* — a clean audit is a passing
+  dimension, so with a default threshold of 2 any healthy task whose dimensions
+  passed would trip a hard pause requiring a human `spawn-resume`. The signal is
+  now **repair non-convergence**: distinct findings the repair loop keeps
+  re-flagging (max `retry_count >= 2` in `repair-log.json`), computed once in
+  `lib_validate.count_nonconverging_repairs` and used by both the runtime pause
+  (`compute_spawn_budget_status`) and the retrospective. The obsolete
+  ensemble-dedup and exempt-auditor machinery that only existed to soften the
+  clean-audit count is removed. `circuit_breaker.WASTED_SPAWN_ABORT_THRESHOLD`
+  (9) is unchanged in value; it now counts non-converging repairs.
+- Cold-started the learned thresholds: retrospectives carry
+  `wasted_spawns_signal_version = 2`, `policy_engine` aggregates only current-
+  version observations (pre-migration clean-audit counts are skipped) and stamps
+  the policy `version: 2`, and `compute_spawn_budget_status` honors learned
+  per-task-class thresholds only under a v2+ policy — falling back to
+  `global_fallback` until the new signal re-learns. Design:
+  `docs/spawn-budget-convergence-design.md`.
+
+---
+
+## [7.5.12] - 2026-07-15
+### Added
+- Segment continuation loop so execution finishes the work instead of stalling
+  when an executor runs out of turns mid-segment. New `ctl next-continuation`
+  reports every incomplete segment (reusing the finish gate's own authority:
+  pending segments + evidence/`files_expected` verification) together with a
+  resume seed — role, model, `files_expected`, `criteria_ids`, and the exact
+  `incomplete_reasons` — so a continuation executor picks up the partial work on
+  disk rather than cold-restarting. The execute skill now loops on it until
+  `complete`; budget is never the stop condition. The only automatic halt is a
+  genuine stall — two consecutive continuations that move nothing (no cleared
+  reason, no evidence growth, no new `files_expected` on disk) — reported as
+  status `stalled` (exit 3) for escalation instead of spinning forever.
+  `continuation-state.json` (stall fingerprints/attempt counts) is ctl-owned and
+  denied to agent roles in the write policy. Adds `tests/test_next_continuation.py`.
+
+---
+
+## [7.5.11] - 2026-07-15
+### Fixed
+- Project-root detection no longer treats the framework home (`~/.dynos` /
+  `$DYNOS_HOME`) or a stray orphan `.dynos` as a project control plane. The
+  `.dynos` name is overloaded — it is both the framework home and each
+  project's control plane — so the old bare-name ancestor walk resolved `$HOME`
+  (which always contains `~/.dynos`) as one giant project, pulling every
+  unrelated repository under it into governance and producing spurious
+  write-policy denials in folders that are not dynos projects. A new shared
+  discriminator (`hooks/lib_dynos_root.is_project_dynos_dir`) rejects the
+  framework home outright and requires a candidate `.dynos` to be a registered
+  project root (or to carry on-disk project state) before it can govern its
+  parent. Applied to every ancestor walk in `write_policy` and `pre_tool_use`,
+  and the out-of-scope write path now decides from the target location instead
+  of governing-when-unsure. Adds `tests/test_dynos_root_scope.py`.
+- Cleared six pre-existing red tests on `main`. Five were stale fixtures that
+  built task directories without a `manifest.json` and so were dropped by the
+  stale-binding hardening (7.5.10) before role/scope resolution ran; their
+  helpers now write a non-terminal manifest as a real task dir always would
+  (`test_role_file_fallback`, `test_bash_destination_extraction`). The sixth
+  was a genuine model-literal lint violation: an escalation comment in
+  `hooks/lib_core.py` named vendor model tiers directly; it now uses the
+  cheap/mid/deep-tier vocabulary already used elsewhere in the file.
+
+---
+
+## [7.5.10] - 2026-06-23
+### Fixed
+- Terminal task transitions now clear per-session task bindings, so a completed
+  dynos-work task no longer leaves the pinned orchestrator session governed by
+  stale write-policy state. Stale `DYNOS_TASK_DIR` values and session-task
+  bindings are also ignored or pruned when their manifest is already terminal.
+
+---
+
+## [7.5.9] - 2026-06-22
+### Fixed
+- Ensemble DONE gate now binds escalation on `finding_count`, not just
+  `blocking_count`. The cascade protocol escalates to the deep tier (opus) on
+  **any** voting-model finding — a non-blocking nit at haiku still warrants opus
+  confirmation — but `_check_ensemble_voting` (`lib_core.py`) previously accepted
+  a clean-ish ensemble whenever every voting receipt was zero-*blocking*. That
+  left a seam: an auditor with non-blocking haiku findings could be run at sonnet
+  (or skip escalation entirely) and still pass the gate, silently dropping the
+  protocol-required opus shard while the prose rule was satisfied only on paper.
+  The gate now requires an opus escalation receipt whenever any voting-model
+  receipt reports `finding_count != 0`, so the documented cascade is enforced by
+  the harness instead of left to the spawning agent's discretion under token
+  pressure. Added regression coverage for the non-blocking-finding path
+  (`test_gate_done_ensemble.py`).
+
+---
+
+## [7.5.8] - 2026-06-22
+### Fixed
+- Auditors no longer run out of turns before writing their report. The auditor
+  prompt builder (`router.py audit-inject-prompt`) now deterministically
+  appends a write-first "Turn Budget Discipline" block to **every** auditor
+  spawn — sized to the selected model/tier (15 / 20 / 25 tool calls) —
+  instructing the auditor to write its report skeleton plus a Progress Ledger
+  before reading the diff and to finalize a (possibly truncated) report rather
+  than hit the `maxTurns` cap with nothing on disk. Previously only the
+  executor prompt builder injected this; auditors relied on a per-file section
+  that 16 of 20 auditor agents were missing, so sonnet/haiku auditors
+  (architecture, test-strategy, docs-accuracy, …) routinely died before
+  writing and had to be re-spawned.
+- Normalized all 20 auditor agent files to carry the `## Turn Budget
+  Discipline` and `## Progress Ledger` sections, so standalone spawns that
+  bypass the injector get the same discipline.
+
+### Removed
+- Deleted the dead per-session write-first watchdog (`pre_tool_use.py
+  ::_run_watchdog` and `_watchdog_*` helpers) and the orphaned `ctl spawn-prep`
+  command (plus its constants, argparser, and the `clear-role` attempt-stripping
+  block). The watchdog could never fire: the audit path arms grants via `ctl
+  stamp-role`, which never sets `expected_artifact`/`budget`, and grants are not
+  consumed under the shared-session actor-resolution path, so it always
+  fail-opened. `spawn-prep` (the only writer of those grant fields and the
+  report skeleton) had zero callers. Simplified `actor_identity.append_grant`
+  to drop the now-unused `expected_artifact`/`attempt`/`budget` kwargs, and
+  updated `skills/audit/SKILL.md` to stop documenting a safety net that did not
+  exist. Removed the obsolete `test_watchdog.py`, `test_spawn_prep.py`,
+  `test_ctl_spawn_prep.py`, and `test_pre_tool_use.py`.
+
+---
+
+## [7.5.7] - 2026-06-22
+### Fixed
+- Task-id allocation is now collision-resistant across concurrent worktrees.
+  The previous `task-{YYYYMMDD}-{seq}` scheme derived the sequence by globbing
+  the local, root-relative `.dynos/`, so worktrees that branched at once each
+  saw an empty set, all landed on `seq=001`, and produced identical ids —
+  causing last-writer-wins clobbering in the shared persistent project store
+  (keyed by task_id). Ids now carry a 32-bit CSPRNG entropy suffix
+  (`task-{YYYYMMDD}-{seq:03d}-{hex}`) via a single shared
+  `lib_core.allocate_task_id` helper used by both `ctl.py` and
+  `manual_pipeline.py`, which also unifies the date segment on UTC and claims
+  the task dir atomically with retry. Strict `\d{3}$` task-id matchers in
+  `lib_tokens_hook.py` and the dashboard vite-plugin were widened to accept the
+  optional suffix while still rejecting path traversal.
+
+---
+
+## [7.5.6] - 2026-06-21
+### Fixed
+- Enforce per-model ensemble audit receipt accounting by requiring `audit-{auditor}-{model}` shard receipts, rejecting pre-prefixed `audit-*` shard names, and documenting the required audit skill invocation.
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.6`.
+
+---
+
+## [7.5.5] - 2026-06-21
+### Fixed
+- Prevent concurrent dynos-work sessions from sharing project-global active-task and orchestrator-session state by adding session-scoped task bindings and multi-session orchestrator pins.
+- Resolve hook task context from absolute tool target paths before falling back to `cwd`, preventing linked-worktree auditors from inheriting the main worktree's role state when Claude reports an ambiguous subagent cwd.
+- Harden spawn-log and web-tool telemetry hooks so ambiguous multi-task checkouts skip instead of logging to the highest-numbered task, while session bindings and explicit task paths route to the intended worktree task.
+- Avoid token attribution to the wrong task when multiple tasks are active; unbound ambiguous sessions now preserve usage in the orphan token ledger.
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.5`.
+
+---
+
+## [7.5.4] - 2026-06-19
+### Changed
+- Inject ruthless self-implicating audit briefs into dynos auditor prompts.
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.4`.
+
+---
+
+## [7.5.3] - 2026-06-19
+### Changed
+- Expand foundry auditor and executor role coverage for architecture, threat modeling, contracts, accessibility, privacy, supply chain, infrastructure, observability, release, and data integrity work.
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.3`.
+
+---
+
+## [7.5.2] - 2026-06-17
+### Changed
+- Add repo-level release hygiene automation.
+
+### Plugin / Distribution
+- Bump package and plugin metadata to `7.5.2`.
+
+---
+
+## [7.5.1] - 2026-06-15
+### "Claude Subagent Compatibility": Stamped Roles Work Where Subagents Share a Session
+
+Claude Code spawns subagents that share the orchestrator's `session_id` and `transcript_path` with no distinguishing field (claude-code #7881), so the D3 per-session actor model resolved every planner/executor/auditor subagent as `orchestrator`. Their role grants went unconsumed and `write_policy` denied their role-scoped writes — the planning and execute pipelines could only complete in fast-track inline mode. (#212)
+
+### Fixed
+- **Orchestrator role adoption:** a new `subagent_isolation` capability flag (`.dynos/config/policy.json`, default `false`) lets the pinned orchestrator session adopt the stamped `active-segment-role` on harnesses that do not isolate subagent sessions (Claude Code), making the existing `ctl stamp-role` calls effective. Setting `subagent_isolation: true` restores strict D3 (the orchestrator never adopts a stamped role).
+- Forgery defenses unchanged: `control-plane.json` and the orchestrator-session pin remain denied to all roles; `audit-reports/` writes remain cross-checked against `spawn-log.jsonl` at receipt time.
+- New diagnostic event `orchestrator_role_adopted` allowlisted in `hooks/lib_log.py`.
+
+### Plugin / Distribution
+- Bump `.claude-plugin/plugin.json`, `package.json`, `.claude-plugin/marketplace.json`, and `.codex-plugin/plugin.json` to `7.5.1`.
+
+---
+
+## [7.5.0] - 2026-06-12
+### "Selection, Durability, Enforcement, Scope": Four-Layer Foundation for Audited Execution
+
+This release completes the execution-audit-repair pipeline's foundation across selection truth, durability contracts, per-session enforcement, and compute budgets (task-20260612-001: 9-segment graph, TDD-first build, 4-layer validation, full receipting).
+
+### Added
+- **L1 Selection Truth:** receipt-backed `select_eligible_reports` with attempt isolation (`{auditor}-{model}-attempt-{n}.json` filenames), status/receipt/stage triple-check gate path, and permissive repair-planning path. `receipt_audit_done` gains `shard_step_name` and `stage` fields; audit-report schema introduces `status` (lifecycle) and `verdict` fields. `_collect_latest_audit_reports` removed.
+- **L2 Durability:** `ctl spawn-prep` attempt isolation and continuation support; `append_grant` now carries `expected_artifact`, `attempt`, and `budget`. Durability Protocol and Progress Ledger added to all executor and auditor agents. `execute` skill mandates two-phase A/B writes in all entry points.
+- **L3 Enforcement:** per-session write-first watchdog in `pre_tool_use.py` tracking tool-call-counters in `.json`, deny-once with K=5 cooldown, preventing runaway tool use mid-stream.
+- **L4 Scope:** LOC-weighted `compute_segment_budget` (files_loc, LOC_BASE/LOC_SLOPE=400/1) with audit sharding (AUDIT_SHARD_FILE_THRESHOLD=30 files, LOC_THRESHOLD=8000), per-directory cluster briefs plus mandatory cross-cutting brief for large segments.
+
+### Changed
+- Receipt schema version bumped to match spawn-prep/execution flow changes; spawn receipts auto-compute attempt and stage fields.
+- All executor agents (specification, execution, repair-coordinator, security-auditor, code-quality-auditor, performance-auditor) updated to include Durability Protocol and Progress Ledger in task narratives.
+- Audit sharding logic applied to all audit segments; cluster briefs standardize large-file aggregation behavior.
+
+### Plugin / Distribution
+- Bump `.claude-plugin/plugin.json`, `package.json`, `.claude-plugin/marketplace.json`, and `.codex-plugin/plugin.json` to `7.5.0`.
+
+---
+
+## [7.4.2] - 2026-06-11
+### "Codex Compatibility": Same Foundry, Second Host
+
+This release adds Codex plugin packaging while preserving the existing dynos-work philosophy: human-approved spec and plan gates, deterministic control-plane writes, audited execution, repair loops, and project learning stay intact. Claude Code remains supported by the existing plugin metadata.
+
+### Added
+- **Codex plugin manifest** at `.codex-plugin/plugin.json`, including interface metadata and the existing `skills/` directory as the Codex-discoverable skill surface.
+- **Execution grouping skill** at `skills/execution/SKILL.md` so Codex skill discovery accepts the executor grouping directory without changing the specialized executor flow.
+
+### Changed
+- Skill command funnels and hook commands now resolve the plugin root via `CODEX_PLUGIN_ROOT` first, falling back to `CLAUDE_PLUGIN_ROOT`, so the same `bin/dynos` control-plane path works under either host.
+- Session-start context uses host-neutral dynos-work wording while keeping the same routing and start/execute/audit guidance.
+- README now documents Claude Code and Codex install/use paths.
+- Prose-policy test substitutions understand the new Codex/Claude root fallback expression.
+
+### Fixed
+- `telemetry/global_dashboard.py` no longer embeds escaped HTML inside an f-string expression, restoring Python compile compatibility for pre-3.12 interpreters.
+- `run-audit-setup` now writes the required `audit-routing` receipt from the deterministic audit plan, so the DONE gate can enumerate routed auditors instead of failing on a missing receipt.
+
+### Host-Aware Model Tier Abstraction (also in this release; task-20260611-001, built end-to-end by the foundry pipeline)
+
+Built end-to-end by the foundry pipeline itself (task-20260611-001: spec 28 criteria, 9-segment graph, TDD-first RED suite, 2 repair cycles, ensemble re-audits — all receipted in-task). Model orchestration no longer speaks vendor names outside one module.
+
+### Added
+- **`hooks/lib_models.py`** (leaf): ordered tiers `fast < balanced < deep`, `TIER_TO_MODEL` per host (claude: haiku/sonnet/opus; codex: all null initially), `ROLE_DEFAULT_TIERS` (18 roles), `resolve_model_for_tier` / `model_to_tier` / `valid_models_for_host`. Guard test (`tests/test_model_literal_guard.py`) holds vendor literals to this module (`# noqa: model-literal` escape for prose) — burned 87 violations to 0.
+- **`hooks/lib_host.py`** (leaf): `detect_host` (CODEX_PLUGIN_ROOT → CLAUDE_PLUGIN_ROOT → claude), persisted-host read/write for `.dynos/control-plane.json` — which is hook-owned in write_policy (agent writes denied; it is load-bearing for receipt anti-forgery).
+- **`memory/lib_migrate_host.py`**: idempotent, receipt-guarded one-time backfill stamping learning records `host=claude` + `model_tier`; auto-triggered on the next policy run.
+- **Receipts v7**: spawn receipts self-compute `{host, tier, resolved_model}`; writers REFUSE models invalid for the active host (claiming a claude model under codex fails at write time); `validate_receipt_model_field`; `RECEIPT_CONTRACT_VERSION` 6→7 with `spawn-*` floor.
+- **Fail-closed wiring under null-mapping hosts**: `floor_unmet: true` recorded when a floor (security=deep) is unsatisfiable; ensemble voting disabled with `reason: host_null_mapping`; retry escalation records `escalation_unavailable` (router helper wired through ctl's escalation path); token capture marks `host_unsupported` instead of silently defaulting (entry path resolves the persisted host).
+- 110+ new tests across 10 `tests/test_hostmodel_*.py` files plus the literal guard.
+
+### Changed
+- Claude behavior is byte-identical: the 18-role routing table resolves exactly as before (parametrized test); full-suite failure set byte-identical to the pre-task baseline.
+- Q-learning arms re-keyed to tiers internally; emitted `model_override` resolves through the host (opus under claude — unchanged); tool budgets, validators, postmortem-improve proposals, and ctl escalation all consume `lib_models`.
+- `agents/repair-coordinator.md` and `skills/audit/SKILL.md` prose use tier language with host-qualified examples; agents frontmatter intentionally untouched.
+- 6 new prevention rules minted by the task's own postmortem (production-caller requirements, signature locks, write-first executor discipline).
+
+### Plugin / Distribution
+- Bump `package.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `.codex-plugin/plugin.json` to `7.4.2`.
+
+---
+
+## [7.4.1] - 2026-06-11
+### "Permissions-ON": The Plugin Stops Denying Its Own Pipeline
+
+A real permissions-on run (no `--dangerously-skip-permissions`, no blanket allow) showed the plugin denying actions its own skills prescribe: `/tmp` payload staging, `2>/dev/null` redirects, `rm active-segment-role`, orchestrator writes blocked by whatever role was last stamped for a subagent, and `run-execution-verify-evidence` hard-erroring after `run-execution-finish`. 7.4.1 fixes the causes per `docs/permissions-on-design.md` while tightening every guardrail it touches. Design doc: `docs/permissions-on-design.md`; spec addendum: `docs/write-boundary-spec.md`.
+
+### Added
+- **Per-actor role resolution (D3):** SessionStart pins the orchestrator session (`.dynos/orchestrator-session.json`, hook-owned); the main session always resolves to the new `orchestrator` role and never reads role files. Subagents consume single-use grants (`ctl grant-role`, ledger at `role-grants.json`, wrapper-required) bound immutably per session (`role-bindings.json`, hook-owned). `ctl clear-role` replaces the policy-denied `rm active-segment-role`. Legacy role-file resolution is preserved for unpinned sessions.
+- **Verification-evidence runner (D6):** execution-graph segments may declare `verify_commands`; `ctl run-verification-evidence` executes them and captures exit codes + output into ctl-owned `evidence/verification/{seg}.json` (executors are policy-denied from writing it), hash-bound by a receipt. `run-execution-finish` requires a passing record for every declaring segment; the spec-completion auditor cites the record instead of trusting executor narrative — execution-based acceptance criteria are now machine-verified.
+- **Task scratch namespace (D2):** `.dynos/task-*/_scratch/` is sanctioned temp space for recognized actor roles; CI asserts no gate/receipt/validator ever reads it.
+- **stdin payloads (D1):** `write-classification` / `write-execution-graph` / `write-repair-log` accept `--from -`; skills pipe LLM-returned payloads via heredoc instead of staging files.
+- **`ctl run-start-init`** replaces start Step 0's six hand-run actions (manifest moves from agent-write to ctl-write); **`ctl tdd-receipt`** replaces the inline-python receipt snippet; **`dynos hook <script>`** funnels helper scripts without `PYTHONPATH=` incantations.
+- **Self-modification guard (H1):** agent roles (including executors) can no longer write the installed plugin directory, `~/.claude/plugins/`, `~/.claude/settings*.json`, or `~/.dynos/` — closing the "agent edits its own guardrails" hole. Developer mode (plugin source repo) exempts the plugin-root check only.
+- **Prose↔policy contract test** (`tests/test_skill_prose_policy_contract.py`): extracts every fenced command block from the pipeline skills, runs the production destination extractor + `decide_write`, and fails CI on any prescribed-but-denied write, forbidden token (`/tmp`, `PYTHONPATH=`, `rm active-segment-role`, repo-relative hook calls), unregistered ctl subcommand, or read-only agent instructed to write files.
+- **Investigator dossier-only enforcement (D7-3):** the pre-tool-use hook denies investigator Grep/Glob and restricts Read to `.dynos/investigations/` + dossier-referenced files; `triage.py finalize` validates structure + citations and persists report + markdown (the read-only agent now RETURNS its JSON). Classifier gains `ci-failure` / `config-error` types.
+
+### Changed
+- **Bash write detection is quote-aware (D5):** shlex tokenization with heredoc stripping replaces raw-string regexes — `>` inside quoted prompts/JSON no longer produces false write destinations; `/dev/null` and friends are recognized sinks. Legacy regexes remain only as the fail-closed fallback for unparseable commands.
+- **Denials are self-explaining:** every write-policy denial names itself as a plugin guardrail (not a Claude Code permission), the role, the path, and the sanctioned alternative (wrapper command or `_scratch/`), with a degraded-actor diagnostic when relevant.
+- **`run-execution-finish` verifies evidence inside the stage gate** (evidence files, `files_expected`, declared verifications); `run-execution-verify-evidence` is legal at EXECUTION *and* TEST_EXECUTION (it previously hard-errored after finish — the execute Step 5 dead-end).
+- **`files_expected` supports directories (`src/pkg/`) and path-aware globs (`src/**/*.py`)** across the diff-membership check, evidence existence, ownership, and the cross-segment exclusivity rule (which got stricter: containment counts as overlap).
+- **Validator errors are self-correcting:** enum violations name the valid set with did-you-mean hints (`'ci'` → `'infra'` — `ci` is intentionally NOT a domain; `'backend'` → `'backend-executor'`). Plan Reference-Code checks only slash-containing tokens and honors a "Files to be created" section.
+- **Skill prose rewritten to the `bin/dynos` funnel:** all `python3 hooks/ctl.py` / `PYTHONPATH=...` invocations in the pipeline skills route through `"$DYNOS" ctl` / `"$DYNOS" hook`; a permissions-ON user can allow the single `<plugin-root>/bin/dynos` prefix once. `hooks.json` SessionStart matcher gains `resume` so the pin survives resumed sessions.
+- Conformance fixes: `execute/SKILL.md`'s false "audit-* roles cannot be stamped" claim corrected; repair-coordinator (no Write/Bash) now returns its payload for the orchestrator to persist via stdin; security-auditor description no longer claims "Read-only" while prescribing its report write.
+
+### Plugin / Distribution
+- Bump `.claude-plugin/plugin.json` and `package.json` to `7.4.1`.
+
+---
+
+## [7.4.0] - 2026-05-05
+### "Wider Drain": Residual Queue Captures More Sources
+
+The 7.3.0 producer admitted only `claude-md-auditor` and `dead-code-auditor` non-blocking findings — narrow on purpose, but narrow enough that running the queue against itself excluded most of the actionable follow-ups it surfaced. 7.4.0 broadens the producer to three more auditors and adds a second source surface so postmortem prevention rules with concrete enforcement (test, lint, static-check, ci-gate, runtime-guard) land in the same queue rather than only `prevention-rules.json`.
+
+### Added
+- Producer now admits non-blocking findings from `security-auditor`, `performance-auditor`, and `code-quality-auditor` (in addition to `claude-md-auditor` and `dead-code-auditor`). Severity-`info` and category skip-list rules still apply.
+- New `lib_residuals.ingest_prevention_rules(root, rules)` helper that ingests postmortem prevention rules with actionable enforcement (test / lint / static-check / ci-gate / runtime-guard) into the residual queue. Advisory and review-checklist rules are deliberately excluded.
+- `postmortem_analysis.apply_analysis` now calls the new helper after writing prevention rules, so engineering-actionable rules surface as queue items alongside their write to `prevention-rules.json`.
+
+### Plugin / Distribution
+- Bump `package.json` and `.claude-plugin/plugin.json` to `7.4.0`.
+
+---
+
+## [7.3.0] - 2026-05-04
+### "Residual Drain": Non-Blocking Findings Become an Overnight Backlog
+
+The theme of 7.3.0 is giving non-blocking audit findings somewhere to go. Instead of disappearing into the audit report, advisory-grade findings now flow into a persistent backlog that can be inspected on demand and drained autonomously while you sleep.
+
+### Added
+- **Producer hook in audit-finish**: every audit cycle now appends its non-blocking findings to `proactive-findings.json`, so advisory-grade signals survive past the task they were found in.
+- **`/dynos-work:residual` skill**: new user-facing skill with `list` and `run-next` subcommands for inspecting the residual queue and draining one item at a time.
+- **Overnight drain pattern**: pair the residual skill with the `/loop` runner (`/loop 1h /dynos-work:residual run-next`) to autonomously chip away at the backlog between active sessions.
+
+### Plugin / Distribution
+- Bump `package.json` and `.claude-plugin/plugin.json` to `7.3.0`.
+
+---
+
+## [7.2.0] - 2026-04-21
+### "Write Boundaries": Control-Plane Ownership, Wrapper Persistence, Task Diagnostics
+
+The theme of 7.2.0 is putting a hard write boundary between LLM-authored work artifacts and framework-owned control-plane state. The runtime now refuses direct agent writes to control-plane files, moves hybrid artifacts behind deterministic ctl wrappers, and exposes per-task write-boundary diagnostics so violations are visible instead of implicit.
+
+### Added
+- **Central write policy**: new `hooks/write_policy.py` defines role-based write allowlists, control-plane classification, wrapper-required decisions, and structured `write_policy_allowed` / `write_policy_wrapper_required` / `write_policy_denied` events.
+- **Wrapper persistence for hybrid artifacts**: `ctl.py` now owns deterministic persistence for `execution-graph.json`, `repair-log.json`, and `classification.json`, including normalization, validation, and atomic writes.
+- **Per-task write-boundary diagnostics**: dashboard API and task detail UI now surface write-policy counts, top denied paths, top wrapper-required paths, and recent policy events.
+- **Write-boundary enforcement tests**: added policy-matrix, wrapper, prompt-prose, and enforcement coverage for control-plane writes and router sidecar paths.
+- **Spec and workflow docs**: added `docs/write-boundary-spec.md` plus supporting workflow and terminal-pipeline notes.
+
+### Changed
+- **Classification persistence moved behind ctl**: planner/start flows now write classification payloads through `write-classification` instead of mutating `manifest.json` directly.
+- **Planner and repair prompts aligned to wrappers**: planning and audit/repair prose now instruct models to emit payloads to temp JSON and persist them only through ctl wrapper commands.
+- **Executor ownership checks hardened**: patch/apply validation now rejects executor writes to protected task artifacts and reserves evidence/audit/control-plane paths by role.
+- **Router sidecar writes are policy-checked**: injected prompt sidecars now go through write-policy validation instead of bypassing the new boundary.
+
+### Fixed
+- **Prompt drift no longer silently bypasses control-plane ownership** for `manifest.json`, `receipts/**`, `handoff-*.json`, `external-solution-gate.json`, wrapper-owned graph/repair-log/classification artifacts, and related task state.
+- **Dashboard observability gap** around write-boundary denials and wrapper-required attempts.
+- **Version metadata drift**: package and plugin release surfaces are now aligned on `7.2.0`.
+
+### Plugin / Distribution
+- Bump `package.json`, `.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json` to `7.2.0`.
+- Bump `hooks/dashboard-ui/package.json` and `hooks/dashboard-ui/package-lock.json` to `0.2.0`.
+
+## [7.1.0] - 2026-04-19
+### "Close the Anti-Pattern": Receipt-Driven State Machine, Trust-Me-Bro Elimination, Modular Runtime
+
+The theme of 7.1.0 is moving the state machine from pull-based (LLM decides when to advance) toward receipt-driven (scheduler advances when proofs are on disk), and closing the trust-me-bro anti-pattern across every control-plane surface. Receipt writers self-compute machine-derivable fields — callers can no longer supply counts, hashes, or scores. The contract version is bumped from 2 → 4 in two waves.
+
+### Added
+- **Receipt-driven scheduler POC**: new `hooks/scheduler.py` exports a pure `compute_next_stage(task_dir) -> (next_stage | None, list[missing_proofs])` and an I/O-capable `handle_receipt_written(...)` dispatcher. `write_receipt` in `lib_receipts.py` now synchronously invokes the scheduler after the atomic write, so writing the `human-approval-SPEC_REVIEW` receipt advances the task to `PLANNING` without any caller running `ctl.py transition`. Scope ceiling is explicit: `compute_next_stage` returns `(None, [])` for every non-SPEC_REVIEW stage. `<!-- scheduler-owned: X -> Y -->` marker in skill prose opts a transition out of the LLM-must-mention-the-ctl-command linter. New `receipt_scheduler_refused` writer + `scheduler_transition_refused` / `scheduler_transition_race` diagnostic events.
+- **Deterministic rules engine** (#125): 6 prevention-rule templates (`pattern_must_not_appear`, `co_modification_required`, `signature_lock`, `caller_count_required`, `import_constant_only`, `every_name_in_X_satisfies_Y`, `advisory`) with structured params. Rules from postmortem analysis are normalized to these templates and enforced by `run_checks` at `REPAIR_EXECUTION → TEST_EXECUTION` / pre-DONE gates via `receipt_rules_check_passed`.
+- **`rules-check-passed` receipt + transition gate**: error-severity violations refuse to write the pass receipt, blocking DONE transition. Prevention-rules file hash is pinned to the receipt; drift after the check forces a re-run.
+- **LLM-powered postmortem analysis**: `postmortem_analysis.py build-prompt` / `apply` pipeline. `opus` analyst reads deterministic postmortem + findings and returns structured JSON with root_causes, prevention_rules, repair_failures. Rules merge into `prevention-rules.json` via the template normalizer. `postmortem_rule_promoted`, `postmortem_rule_dropped`, `postmortem_rule_promotion_dropped` events.
+- **Hierarchical Q-learning**: per-category action spaces (3 Q-tables) replace the flat executor×model table. `ctl.py repair-plan` surfaces Q-derived assignments; `repair-update` writes outcomes back. No-op when learning is disabled.
+- **Auditor ensemble voting**: router-plan entries can set `ensemble: true` with `ensemble_voting_models` (haiku + sonnet) and `ensemble_escalation_model` (opus). Both voters zero → pass; either voter non-zero → escalate to opus (binding). Per-model injected-prompt sidecars disambiguate ensemble call paths.
+- **CI linters** (+5): `test_ci_event_emit_consume` (every `log_event` name must be consumed or in `DIAGNOSTIC_ONLY_EVENTS`), `test_ci_value_error_coverage` (every `raise ValueError` in production has an adversarial `pytest.raises(match=…)`), `test_ci_receipt_selfverify_parity` (every receipt writer self-verifies or is allowlisted), `test_skill_stage_references::test_no_skill_prose_advises_manual_stage_edit` (scans for `manually set` within 80 bytes of `"stage"` — catches DONE-escape-hatch regressions), `test_skill_stage_references::test_scheduler_owned_transitions_are_exempt_from_transition_prose_requirement` (caps scheduler-owned markers at `SPEC_REVIEW -> PLANNING`).
+- **Plug-and-play modularity**: auditor registry, executor discovery, action spaces, ensemble wiring, handler discovery — all opt-in via registry lookups rather than hardcoded lists.
+- **`bus` CLI subcommands** on `ctl.py`: `emit`, `drain`, `status`, `handlers`.
+- **`router-cache-status`**: reports freshness of the per-task executor-plan cache (see Performance).
+- **External-solution gate in start skill**: structured JSON artifact at `.dynos/task-{id}/external-solution-gate.json` captures when the planner consulted external docs and which candidate was chosen. Includes untrusted-content contract (paraphrase-not-quote, URL allowlist, instruction-shaped-content rejection, body caps).
+- **Global dashboard live updates** (#121): regen-on-fetch + JS polling. Dashboard reflects current task state without manual refresh.
+- **Stage-aware artifact validation**: `validate_task_artifacts` no longer false-fails on early stages (pre-spec, pre-plan) by conditioning required artifacts on current stage.
+- **Contract version 4** (#127, #132): receipts embed `contract_version: 4`. `MIN_VERSION_PER_STEP` enforces per-receipt minimums. Writers refuse to emit below-floor; readers refuse to consume below-floor.
+
+### Changed
+- **Receipt writers self-compute machine-derivable fields** (#123, #127, #130, #131, #132, #133): `receipt_retrospective`, `receipt_plan_validated`, `receipt_plan_audit`, `receipt_audit_done`, `receipt_postmortem_generated` no longer accept caller-supplied `quality_score`, `cost_score`, `efficiency_score`, `total_tokens`, `segment_count`, `criteria_coverage`, `validation_passed`, or `finding_count`. The writers re-read the artifacts themselves and raise `TypeError` on any legacy kwarg. Closes the trust-me-bro input-trust hole.
+- **`receipt_audit_done` TOCTOU fixed** (#133 / MA-005): when `report_path is None`, `finding_count` and `blocking_count` MUST both be zero. Auditors with real findings materialize a report file, and the writer re-reads and cross-checks.
+- **`receipt_planner_spawn` enforces sidecar**: `injected_prompt_sha256` is required (no-sidecar legacy path removed). The sidecar file at `receipts/_injected-planner-prompts/{phase}.{sha256,txt}` pins the exact prompt bytes.
+- **`receipt_executor_done` enforces sidecar**: per-segment injected prompt sidecar must exist and match the supplied digest.
+- **`write_receipt` chokepoint dispatch**: every receipt write triggers `scheduler.handle_receipt_written` after the atomic write + existing `log_event("receipt_written", ...)`. Exception in the scheduler dispatch is swallowed to stderr — never rolls back the durable receipt.
+- **`cmd_approve_stage` stops calling `transition_task`**: exits 0 after the receipt is durably on disk; the scheduler drives the resulting stage advance asynchronously in-process. Docstring updated to match.
+- **Post-completion drain is async** (#117): `task-completed` handler no longer blocks the execute skill's return. Improve / policy_engine / dashboard / registry refresh run after the skill completes.
+- **`evolve.py` → `calibrate.py`**: rename. The shell alias `dynos calibration` routes to `memory/agent_generator.py auto`. Old `hooks/calibrate.py` / `hooks/generate.py` wrappers removed; functionality lives in `agent_generator.py init-registry` / `register-agent` / `auto` subcommands.
+- **`patterns.py` → `policy_engine.py`**: rename. `patterns.md` table data split into JSON (`project_rules.json`) so the LLM-facing prose (`project_rules.md`) no longer drifts against the structured data.
+- **Eventbus flattened**: 4 handlers, 1 event (`task-completed`), 1 drain loop. `receipt_written` and `stage_transition` remain as orthogonal JSONL-only observability events.
+- **`agent_generator` refreshes existing learned agents** (#115): every run regenerates agent `.md` files from the latest retrospective patterns, not just new ones. Bias / format / rule-filtering fixes.
+- **Benchmark scheduler wired as auto-discovered eventbus handler**.
+- **Daemon stripped to trajectory-only**: removed duplicate seeding; calibration CLI added; dormant modules cleared.
+- **Test migration** (#108): 7 unittest files → pytest; 3 dyno-prefixed tests renamed.
+
+### Performance / Determinism
+- **Router executor-plan cache** (#113, #114): `executor-plan` writes a fingerprinted plan to `.dynos/task-{id}/router-cache/executor-plan.json`. Per-segment `inject-prompt` calls reuse the cached plan instead of rebuilding it. Critically, this eliminates re-rolled epsilon-greedy exploration dice between executor-plan and inject-prompt, so the model the executor was spawned under matches the model the prompt was injected for. Cache fingerprint covers graph, policy, effectiveness scores, retrospectives, learned registry, benchmark history, and prevention rules — any drift forces a live rebuild. New `router-cache-status` subcommand. New `router_cache_lookup` / `router_cache_write` events.
+- **`_benchmark_model_for_agent` honors `RouterContext`**: helper no longer re-reads learned registry and benchmark history when called from a path that already has both on its context.
+- **Gap analysis cached + decoupled** (#119): `plan_gap_analysis` no longer runs inside `validate_task_artifacts`; callers invoke it explicitly. Handler work deduplicated.
+- **Worktree slug normalization** (#122): `~/.dynos/projects/{slug}/` derived from the main-repo path, not the worktree path — retrospectives, benchmarks, and learned agents now flow back to the same persistent dir regardless of which worktree executed the task. Safe `migrate` CLI consolidates legacy duplicate slugs.
+
+### Fixed
+- **27 silently-vacuous gates** (#132): receipt/transition gates that checked the wrong field or returned True on empty input. Contract v4 adds explicit non-empty constraints.
+- **10 remaining trust-me-bro LLM surfaces** (#127): contract v3 closes caller-supplied counts on auditor receipts and plan receipts.
+- **8 initial trust-me-bro control-plane gates** (#123): sha256-bound sidecars, hash-drift refusal, explicit kwarg requirements.
+- **6 framework enforcement gaps** (#126) + 4 non-blocking followups (#128): stage-transition + receipt-parity + auditor-registry cross-checks.
+- **G1–G4 postmortem-skip structural guardrails** (#130): `.dynos/deferred-findings.json` TTL registry + `check_deferred_findings` CLI. Removed `quality-above-threshold` from `_POSTMORTEM_SKIP_REASONS`.
+- **Postmortem rule-promotion parity** (#131): `postmortem_rule_promoted` event fires per rule added; `postmortem_rule_dropped` fires per rule dropped. Closes the PR-#130 silent-drop pattern.
+- **MA-005 / MA-007 meta-audit** (#133): `receipt_audit_done` rejects `report_path=None` with non-zero counts; `apply_analysis` emits `postmortem_rule_promoted` per rule on successful promotion (was silent).
+- **Three pipeline regressions** (#116): registry data loss, fast-track stage walk, post-completion receipt gap.
+- **`performance_check`** (#111, #112): stopped flagging `dict.get()` as N+1 queries; indent-stack-based quadratic-loop detection.
+- **Execute skill stage transitions** (#117): post-completion drain dispatched async so `/dynos-work:execute` returns promptly.
+- **Dead code removal** (#109): `cli/assets/hooks`, `cli/assets/memory`, `cli/assets/bin`, `cli/assets/telemetry` subtrees; dormant sandbox modules (`sweeper`, `dream`, `state`, `founder-skill`, stale copies).
+
+### Removed
+- **`no-sidecar legacy path` in `receipt_planner_spawn`**: the pre-#124 `injected_prompt_sha256=None` branch is gone.
+- **Caller-supplied score / count fields** on `receipt_retrospective` / `receipt_plan_validated` / `receipt_plan_audit` / `receipt_audit_done` (also listed under Changed for breaking-change discoverability — legacy kwargs raise `TypeError`).
+- **`quality-above-threshold`** as a valid value in `_POSTMORTEM_SKIP_REASONS` (#130).
+- **`hooks/calibrate.py`** / **`hooks/generate.py`** shell wrappers: functionality lives in `memory/agent_generator.py`.
+- **MCTS / dreamer modules**: extracted to `sandbox/` — out of the main pipeline.
+- **Optional learning modules**: sandboxed; `memory/` is now 1,318 lines. Q-learning / postmortem_improve / agent_generator restored from sandbox when needed.
+
+### Plugin / Distribution
+- Bump `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` to `7.1.0`.
+- Reinstall via `/plugin update dynos-work` to pick up updated skills. Cached-v7.0.0 installations will continue to serve stale skill prompts (notably a stale 5-arg `receipt_retrospective` signature from an intermediate commit) until the update runs.
+
+---
+
+## [7.0.0] - 2026-04-16
+### "Verified Foundry": Tool-Grounded Verification, Compliance, Least Privilege
+
+The foundry moves from LLM-reviewing-LLM to deterministic-tool-checking-LLM across every verification surface. Autofix is extracted to a separate repository. The learning layer becomes explicitly optional.
+
+### Added
+- **Compliance auditing**: security-auditor flags GPL/AGPL deps, generates SBOM via cyclonedx-bom/syft, verifies dependency provenance via Sigstore, checks for missing privacy code (data export, account deletion). New `compliance` category with `comp-` prefix.
+- **Conditional plan sections**: `## API Contracts` required when domains include backend/ui/security; `## Data Model` required when domains include db.
+- **Plan gap analysis**: deterministic hook cross-references API Contracts and Data Model tables against actual route definitions (10+ frameworks) and model/schema definitions (8+ ORMs). Plans can't claim endpoints or tables that don't exist.
+- **Doc-accuracy auditing**: code-quality-auditor runs `validate_docs_accuracy.py` on tasks touching `.md` files.
+- **Per-agent tool boundaries**: all 17 agents declare minimum tool sets in YAML frontmatter. Auditors cannot Write/Edit. Planners cannot Bash.
+- **LEARNING_ENABLED policy flag**: `dynos config set learning_enabled false` disables the entire learning layer. Foundry-only mode is now a single config flip.
+- **Phase-labeled start.md**: 6 phase headers make structure visible. Zero behavior change.
+- **DORA metrics**: `lead_time_seconds`, `change_failure`, `recovery_time_seconds` in retrospectives. `dynos stats dora` aggregator.
+- **Usage telemetry**: module-level dormancy detection. `dynos stats usage` CLI.
+- **`dynos config` CLI**: get/set project policy without hand-editing JSON.
+- **`hooks/compliance_check.py`**: license scanning, SBOM, Sigstore provenance, privacy checks across 10 ecosystems.
+- **`hooks/plan_gap_analysis.py`**: deterministic plan verification against codebase.
+- **`hooks/lib_usage_telemetry.py`**: append-only JSONL telemetry for dormancy detection.
+
+### Removed
+- **Autofix system** (6,327 LOC): `hooks/proactive.py` (3,592 lines), `skills/autofix/`, 5 test files, all autofix constants, Q-table functions, daemon integration, `--autofix` CLI flags. Extracted to `dynos-fit/autofix`.
+- `DYNOS_AUTOFIX_WORKTREE` environment variable.
+- `"autofix"` from `VALID_PIPELINES`.
+
+### Changed
+- `security-auditor` covers `security` + `compliance` categories.
+- `code-quality-auditor` covers `code-quality` + `doc-accuracy` categories.
+- `repair-coordinator` routes compliance and doc-accuracy findings.
+- Audit report schema gains optional `category` field.
+- `validate_task_artifacts` enforces conditional headings + gap analysis.
+- `compute_reward` includes DORA fields.
+- Router gated on `is_learning_enabled()`.
+- Event bus skips learning handlers when disabled.
+- `maintain.py` stripped of all autofix code; daemon preserved for non-autofix maintenance.
+- `start/SKILL.md` gains phase labels; trajectory/learned skill injection gated on learning flag.
+- README rewritten (no autofix, DORA metrics, least privilege, tool-grounded verification).
+
+---
+
+## [6.0.0] - 2026-04-03
+### "Runtime Control Plane": Deterministic Foundry, Live Dashboard, Maintainer Daemon
+
+This release turns the plugin from a primarily prompt-defined foundry into a runtime-backed adaptive control system. The workflow remains human-directed, but key guarantees now live in code: artifact validation, route gating, benchmark-driven promotion, freshness blocking, lineage, and persistent maintenance automation.
+
+### Added
+- Deterministic control runtime:
+  - `hooks/dynoslib.py`
+  - `hooks/dynosctl.py`
+  - `hooks/validate_task_artifacts.py`
+- Task artifact enforcement for:
+  - manifest validation
+  - spec/plan structure
+  - execution-graph coverage, ownership, and cycle detection
+  - repair-log and retrospective validation
+- RL-inspired adaptive runtime components:
+  - `hooks/dynostate.py`
+  - `hooks/dynostrajectory.py`
+  - `hooks/dynosdream.py`
+- Learned component lifecycle tooling:
+  - `hooks/dynoevolve.py`
+  - `hooks/dynoeval.py`
+  - `hooks/dynogenerate.py`
+  - `hooks/dynofixture.py`
+- Benchmark and rollout harnesses:
+  - `hooks/dynobench.py`
+  - `hooks/dynorollout.py`
+  - `hooks/dynochallenge.py`
+- Live routing and automation:
+  - `hooks/dynoroute.py`
+  - `hooks/dynoauto.py`
+- Observability and traceability:
+  - `hooks/dynoreport.py`
+  - `hooks/dynolineage.py`
+  - `hooks/dynodashboard.py`
+- Persistent maintainer runtime:
+  - `hooks/dynomaintain.py`
+  - background daemon mode
+  - manual invoke mode
+  - maintenance status and PID tracking
+- New contributor and internals docs:
+  - `UNDER_THE_HOOD.md`
+  - `ARCHITECTURE.md`
+- Automated live dashboard generation and refresh from hooks
+- Fixture synthesis from completed task retrospectives
+- Benchmark index and lineage graph for task -> component -> fixture -> run traceability
+
+### Changed
+- README rewritten from scratch to be user-facing instead of runtime-internal
+- Founder mode retained as an advisory design-review layer inside the start flow
+- Learned routing now resolves from the live registry, not markdown tables
+- Promotion and rollback now depend on benchmark evidence plus must-pass category checks
+- Route resolution now blocks stale learned components by freshness policy
+- TaskCompleted hook now runs learn, automation, and dashboard refresh automatically
+- SessionStart hook now refreshes dashboard state and can ensure the maintainer daemon is running
+- `/dynos-work:maintain` is now a clearer user-facing manual maintainer path
+
+### Fixed
+- Eliminated several documentation/runtime mismatches where skills described behavior that was not enforced in code
+- Added regression tests for route resolution, auto benchmarking, fixture synthesis, lineage, dashboard generation, challenger rollout, and maintainer cycles
+
+### Security
+- Learned components can no longer silently remain active after benchmark regression or staleness
+- Promotion remains blocked unless challenger evidence clears configured policy thresholds
+
+
+## [5.0.0] - 2026-04-03
+### "Foundry Intelligence": Decision Transformer Architecture
+
+The system evolves from a self-learning platform into a **Trajectory-Driven, Human-Directed Autonomous Software Foundry** with a full Decision Transformer (DT) memory layer.
+
+### Added
+- **`trajectory` Skill:** Manages State-Action-Reward (SAR) sequences. Reconstructs the full trajectory of every task and stores it in `.dynos/trajectories.json` for future retrieval.
+- **`state-encoder` Agent:** Produces a structured State Signature ($) from a module's AST, Dependency Graph, and Finding Entropy. Powers the DT retrieval step.
+- **DT-Informed Discovery:** The `start` skill now spawns the `state-encoder` at the beginning of every task and retrieves the 3 most similar successful past trajectories. Discovery questions are generated from known failure points in those trajectories.
+- **MCTS/Dreaming as a Consultant Service:** The `founder` skill is refactored from an independent entry point into a strategic simulation service. It runs Sandbox Playouts for hard/critical design options and returns a **Design Certificate** (PASS/FAIL, Security Score, Performance Metrics, Recommendation) before the user chooses.
+- **Unified Foundry Start:** Merged the old "Phase 0 Founder Mode" shortcut into the Standard Discovery pipeline. Every task — regardless of prompt size — now follows the full pipeline ending in mandatory human-approval gates.
+
+### Changed
+- **`start` Skill:** Removed the "Phase 0" bypass path. All tasks now begin with RL-informed discovery (Step 1), MCTS Dreaming for hard/critical subtasks (Step 2), and mandatory Spec Review + Plan Review gates for all tasks.
+- **`founder` Skill:** Demoted from independent entry point to a strategic "Dreaming Engine." Its MCTS and Sandbox Simulation logic is now called as a service by `start` for design option vetting only.
+- **Spec Review & Plan Review Gates:** Now explicitly enforced as Hard Rules for every task. No skip paths exist.
+
+### Security
+- **Zero-Trust Founding:** Founder's sandbox simulations are now audited by an Opus-level auditor before Design Certificates are issued to the user.
+
+---
+
+## [4.0.0] - 2026-04-03
+### "God-Mode" Evolution: The Autonomous Software Foundry
+
+This is a major architectural overhaul, transforming the system from a task-based plugin into a **Self-Learning, High-Performance Autonomous Engineering Platform.**
+
+### Added
+- **`founder` Skill:** A new strategic entry point for minimal prompts. Uses **MCTS** and **Dreaming** (Sandbox Simulation) to bootstrap full production-grade systems.
+- **`maintain` Skill:** The Autonomous Backend worker. Performs proactive self-audits, identifies technical debt clusters, and opens automated PRs.
+- **`evolve` Skill:** Manages agent lifecycle through **Shadow Mode** and **Simulation Benchmarking** at `/tmp`.
+- **Ensemble Voting:** High-risk audits now utilize a multi-model consensus (Haiku/Sonnet) before escalating to Opus for 58% cost efficiency.
+- **Critical Path Scheduler:** An optimized execution engine that prioritizes the most "blocking" segments and runs audits in parallel with code implementation.
+- **Incremental Caching:** Skips executor spawns for unchanged segments, reducing token costs by up to 80% on re-runs.
+- **Web Dashboard:** A premium, visual Engineering Control Center (`.dynos/dashboard.html`) with finding density heatmaps and ROI charts.
+- **RAG-Lite Docs Refresh:** Automated fetching of official library documentation during the learning phase.
+- **Global Pattern Syncing:** Cross-project intelligence sharing via external memory paths.
+
+### Changed
+- **Planning Agent:** Upgraded to **Hierarchical Planning** (Master/Worker) to handle high-complexity tasks.
+- **`start` Skill:** Integrated **Founder Mode** (Phase 0) and strategic interrogation loops.
+- **`execute` Skill:** Implemented **Progressive Pipelining** for real-time background auditing.
+- **`learn` Skill:** Decoupled from agent management; now focused on high-density pattern extraction and "Human Insight" gates.
+- **Model Policies:** Transitioned to dynamic, EMA-based model routing (ROI tracking).
+
+### Security
+- **Multi-Modal Visual Audit:** Integrated browser-based vision checks for UI-domain tasks.
+- **Simulation Isolation:** All candidate agents are now verified in a **Security Sandbox** at `/tmp` before promotion.
+- **Downtime Shield:** Automated auto-merge policy is strictly prohibited from merging if any tests are failing.
+
+---
+
+## [3.0.0] - 2026-04-03
+
+### Added
+- Learned agents system: dynos-work generates project-specific executors and auditors that improve over time
+- Agent generation in learn step: analyzes codebase patterns and repair history, rate-limited to every 3 tasks, passive (no extra spawns)
+- Agent Routing table in `dynos_patterns.md`: routes to learned agents when they outperform generics
+- Alongside/replace mode for learned auditors: both run for 3-task proving window, then replace when proven
+- Self-pruning: learned agents soft-deleted to `.archive/` after 3 consecutive tasks of underperformance
+- EMA quad key: (role, model, task_type, source) tracks generic vs learned agent effectiveness separately
+- Finding-overlap tracking for alongside auditor evaluation
+- Path validation on learned agent file reads (defense-in-depth)
+- Sanitization on agent generation instructions (prompt injection prevention)
+- Security-auditor replace protection (can never be replaced by learned agent)
+- Priority-stack composite weights: 0.6 quality + 0.25 efficiency + 0.15 cost
+
+### Changed
+- `skills/learn/SKILL.md` gains Steps 6-9: agent generation, routing table, pruning, mode transitions
+- `skills/execute/SKILL.md` reads Agent Routing table, routes to learned executors when composite is higher
+- `skills/audit/SKILL.md` reads Agent Routing table, supports alongside/replace mode, tracks agent_source and finding overlap in retrospective
+- EMA effectiveness tracking extended from triple to quad key
+
+---
+
+## [2.12.0] - 2026-04-03
+
+### Added
+- `/dynos-work:dry-run` skill with declarative contract validation: each pipeline skill has a `contract.json` sidecar declaring input/output schemas; dry-run validates the chain
+- `/dynos-work:dashboard` skill: hybrid data source rendering policy state from `dynos_patterns.md` plus time-series trends (token cost, model distribution, quality score) from retrospectives
+- UCB exploration bonus in model selection: `ucb_score = composite + 0.5 * sqrt(ln(total) / sample_count)` replaces pure composite, naturally exploring under-observed model/role/task_type triples
+- Prevention rule aging with FIFO eviction: rules carry `created_task_id`, oldest evicted first at 15-rule cap, 3-task eviction exemption prevents bulk flushing
+- Baseline Policy reconstruction from best 3-task quality window when no baseline exists
+- TaskCompleted hook activation: auto-triggers learn after task completion, conditional auto-commit gated on `dynos_auto_commit` in project settings.json
+- 12 `contract.json` sidecar files across all skill directories
+- Rule sanitization in learn skill to prevent prompt injection via finding descriptions
+
+### Changed
+- Token tracking extraction now specifies exact field path (`total_tokens` from Agent tool usage summary)
+- `classification.type` / `task_type` naming normalized with explicit mapping notes across audit, execute, and repair-coordinator
+- Auto-commit uses `git add -u` (tracked files only) instead of `git add -A` to prevent staging secrets
+- Prevention rules table gains `Created` column for age tracking
+
+### Removed
+- `agents/execution-coordinator.md` (orphaned, functionality absorbed by planning agent)
+
+---
+
+## [2.11.0] - 2026-04-02
+
+### Added
+- Actor-critic inspired adaptive model selection: EMA effectiveness scores tracked per (role, model, task_type) triple
+- Model Policy table in `dynos_patterns.md`: recommends optimal model for each agent based on observed quality, cost, and efficiency
+- Skip Policy table: learned skip thresholds per auditor replace hardcoded value of 3
+- Effectiveness Scores table: raw EMA data driving policy derivation
+- Baseline Policy: rolling snapshot for regression detection and revert
+- Reward vector computation in reflect step: quality_score, cost_score, efficiency_score
+- Real token tracking: `token_usage_by_agent`, `total_token_usage`, `model_used_by_agent` in retrospective
+- Meta-validator: bounds checking, monotonicity constraints (security-auditor always Opus), regression detection with rolling baseline blend-back
+- Cold-start gate: hardcoded defaults for first 5 tasks, then adaptive
+- Policy readers in audit skill, execute skill, and repair-coordinator with fallback to defaults
+- Per-task-type baseline token budgets for cost_score (feature: 50k, refactor: 30k, bugfix: 20k, other: 40k)
+
+### Changed
+- `skills/learn/SKILL.md` gains Step 5 (Policy Update) with EMA, policy derivation, meta-validation, and baseline management
+- `skills/audit/SKILL.md` Step 3 reads Skip Policy and Model Policy; Step 5 Reflect captures tokens and computes reward vector
+- `skills/execute/SKILL.md` Step 3 reads Model Policy for executor model selection
+- `agents/repair-coordinator.md` reads Model Policy for retry 0-1 findings; retry >= 2 always Opus (non-negotiable)
+- `dynos_patterns.md` gains four new sections: Model Policy, Skip Policy, Effectiveness Scores, Baseline Policy
+- README updated with adaptive model selection and actor-critic self-improvement details
+
+---
+
+## [2.10.0] - 2026-04-02
+
+### Added
+- Eager two-phase repair: repair starts on first auditor findings (phase 1) while slower auditors continue running; late results feed into phase 2
+- Short-circuit on critical spec failure: spec-completion-auditor critical findings trigger immediate phase 1 repair
+- Parallel repair batch execution: non-overlapping batches run concurrently, only file-conflicting batches are serialized
+- Model escalation on retry: findings failing twice (retry >= 2) automatically upgrade executor to Opus
+- Auditor skip on zero-finding streak: skip-eligible auditors (dead-code, ui, db-schema) auto-skipped after 3+ consecutive zero-finding tasks
+- Per-auditor zero-finding streak tracking in task retrospective (replaces old single-integer field)
+- Late-finding conflict resolution: all late auditor findings queue for phase 2, no interruption of in-progress repairs
+- Cross-phase retry continuity: max_retries (3) applies across both phases combined per finding
+
+### Changed
+- `skills/audit/SKILL.md` Steps 3, 4, 5 rewritten for two-phase pipeline
+- `agents/repair-coordinator.md` updated with phase awareness, `model_override` field, and cross-phase retry rules
+- `auditor_zero_finding_streak` (integer) replaced by `auditor_zero_finding_streaks` (object map) in retrospective schema
+- Repair-coordinator now sets `parallel` field on batches and `model_override` on escalated tasks
+- README updated with new sync optimization details
+
+---
+
+## [2.9.0] - 2026-03-30
+
+### Added
+- Self-improving token efficiency with prevention rules injected into executor spawn instructions
+- Incremental re-audit scoping: re-audit after repair inspects only repair-modified files
+- Spec-completion auditor retains full scope during re-audit for overall requirement coverage
+- Prevention rules from `dynos_patterns.md` filtered by executor type and injected at spawn time
+
+### Changed
+- Audit skill reflect step computes spawn efficiency metrics (subagent_spawn_count, wasted_spawns, zero-finding streaks)
+
+---
+
+## [2.8.0] - 2026-03-30
+
+### Added
+- Debug skill and forensic investigator agent for deep root cause analysis
+- Token consumption optimizations across agents, skills, and hooks
+- Workflow optimization reducing subagent spawns by ~22%
+
+### Changed
+- Removed non-Claude platform configs (Cursor, Gemini CLI, OpenCode, Codex)
+- Session hook and config files updated for v2.8.0
+
+---
+
+Versions prior to 2.8.0 predate this changelog.
+
+[7.2.0]: https://github.com/dynos-fit/dynos-work/compare/v7.1.0...v7.2.0
+[7.1.0]: https://github.com/dynos-fit/dynos-work/compare/v7.0.0...v7.1.0
+[5.0.0]: https://github.com/dynos-fit/dynos-work/compare/v4.0.0...v5.0.0
+[4.0.0]: https://github.com/dynos-fit/dynos-work/compare/v3.0.0...v4.0.0
+[3.0.0]: https://github.com/dynos-fit/dynos-work/compare/v2.12.0...v3.0.0
+[2.12.0]: https://github.com/dynos-fit/dynos-work/compare/v2.11.0...v2.12.0
+[2.11.0]: https://github.com/dynos-fit/dynos-work/compare/v2.10.0...v2.11.0
+[2.10.0]: https://github.com/dynos-fit/dynos-work/compare/v2.9.0...v2.10.0
+[2.9.0]: https://github.com/dynos-fit/dynos-work/compare/v2.8.0...v2.9.0
+[2.8.0]: https://github.com/dynos-fit/dynos-work/compare/v2.7.0...v2.8.0
+[7.0.0]: https://github.com/dynos-fit/dynos-work/compare/v6.0.0...v7.0.0
+[6.0.0]: https://github.com/dynos-fit/dynos-work/compare/v5.0.0...v6.0.0

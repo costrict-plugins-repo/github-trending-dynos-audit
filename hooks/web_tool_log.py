@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""PostToolUse hook for the WebSearch and WebFetch tools.
+
+Captures harness-level evidence of every WebSearch/WebFetch invocation to a
+per-task web-tool-log.jsonl file. Because this hook runs as a subprocess and
+writes via Python file I/O (not through any harness tool), the LLM cannot
+forge entries — write_policy.decide_write explicitly denies all agent roles
+from writing web-tool-log.jsonl.
+
+This mirrors the agent_spawn_log.py trust-substrate pattern.
+
+Invocation (two modes):
+
+  1. CLI mode (shell dispatcher):
+         python3 hooks/web_tool_log.py
+     Reads JSON payload from stdin.
+
+  2. Direct call (tests):
+         mod.main(argv, payload=<dict>)
+     Accepts payload directly; stdin is not read when payload is provided.
+
+Stdin: standard Claude Code hook payload — JSON with ``tool_name``,
+``tool_input``, ``cwd``, and (post only) ``tool_response``. ``tool_name`` is
+normalised through ``_WEB_TOOL_ALIASES``, so a non-Claude harness that spells
+its web tools differently (``web_search``, ``web_fetch``) still lands canonical
+entries in the log.
+
+Output: appends a JSONL line to ``<task_dir>/web-tool-log.jsonl`` where
+``<task_dir>`` is resolved from ``DYNOS_TASK_DIR`` env or by walking ``cwd``
+upward to the nearest ``.dynos/task-*`` directory. If no task dir is
+discoverable, the hook exits 0 silently.
+
+Each JSONL line contains:
+  ts   — ISO 8601 UTC timestamp
+  tool — "WebSearch" or "WebFetch"
+  query — (WebSearch) the search query string, or raw fallback
+  url   — (WebFetch) the URL string, or raw fallback
+
+Exit codes:
+    0 — success, or no active task (silent skip), or non-web tool
+    1 — internal error (malformed stdin, write failure)
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+# Every spelling this hook accepts, mapped to the canonical name the
+# external-solution gate reads back out of web-tool-log.jsonl. Non-Claude
+# harnesses name their web tools differently; normalising the known spellings
+# here means a harness that does fire this PostToolUse hook produces the same
+# substrate and gets enforced at full strength, instead of falling to the
+# gate's degraded host path. Matching is case-insensitive; anything not listed
+# is not a web tool as far as this hook is concerned.
+_WEB_TOOL_ALIASES: dict[str, str] = {
+    "websearch": "WebSearch",
+    "web_search": "WebSearch",
+    "web.search": "WebSearch",
+    "webfetch": "WebFetch",
+    "web_fetch": "WebFetch",
+    "web.fetch": "WebFetch",
+}
+
+
+def _canonical_web_tool(tool_name: Any) -> str | None:
+    """Return the canonical web-tool name for *tool_name*, or None."""
+    if not isinstance(tool_name, str):
+        return None
+    return _WEB_TOOL_ALIASES.get(tool_name.strip().lower())
+
+
+def _task_is_non_terminal(task_dir: Path) -> bool:
+    try:
+        manifest = json.loads((task_dir / "manifest.json").read_text(encoding="utf-8"))
+        return isinstance(manifest, dict) and manifest.get("stage") not in {
+            "DONE", "FAILED", "CANCELLED", "CALIBRATED",
+        }
+    except Exception:
+        return False
+
+
+def _task_dir_from_path(path: Path) -> Path | None:
+    try:
+        current = path.resolve()
+    except Exception:
+        return None
+    for ancestor in [current, *current.parents]:
+        if ancestor.parent.name == ".dynos" and ancestor.name.startswith("task-"):
+            return ancestor if _task_is_non_terminal(ancestor) else None
+    return None
+
+
+def _project_root_from_ancestors(cwd: Path) -> Path | None:
+    current = cwd.resolve()
+    for ancestor in [current, *current.parents]:
+        if (ancestor / ".dynos").is_dir():
+            return ancestor
+    return None
+
+
+def _find_task_dir_from_ancestors(cwd: Path) -> Path | None:
+    """Walk upward from cwd, returning only an unambiguous active task."""
+    direct = _task_dir_from_path(cwd)
+    if direct is not None:
+        return direct
+    project_root = _project_root_from_ancestors(cwd)
+    if project_root is None:
+        return None
+    try:
+        candidates = [
+            task for task in sorted((project_root / ".dynos").glob("task-*"), reverse=True)
+            if _task_is_non_terminal(task)
+        ]
+    except OSError:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _resolve_task_dir(cwd: Path, payload: dict[str, Any]) -> Path | None:
+    """Resolve task dir from DYNOS_TASK_DIR, session binding, or unambiguous cwd."""
+    env_task = os.environ.get("DYNOS_TASK_DIR", "").strip()
+    if env_task:
+        try:
+            return Path(env_task).resolve()
+        except OSError:
+            return None
+    session_id = str(payload.get("session_id") or "").strip()
+    project_root = _project_root_from_ancestors(cwd)
+    if session_id and project_root is not None:
+        try:
+            import actor_identity
+            bound = actor_identity.lookup_session_task(project_root, session_id)
+            if bound is not None:
+                return bound
+        except Exception:
+            pass
+    return _find_task_dir_from_ancestors(cwd)
+
+
+def _utc_iso8601() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
+    """Atomically append a JSONL line. Creates parent dirs as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def _build_entry(tool_name: str, tool_input: Any) -> dict[str, Any]:
+    """Build a JSONL entry for a WebSearch or WebFetch invocation.
+
+    AC 3: Each line has ts (ISO8601 UTC), tool, and either query (WebSearch)
+    or url (WebFetch). Fallback: if tool_input.query/.url is absent or
+    non-string, serialize tool_input as JSON string and store under the
+    expected key.
+    """
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    entry: dict[str, Any] = {
+        "ts": _utc_iso8601(),
+        "tool": tool_name,
+    }
+
+    if tool_name == "WebSearch":
+        raw = tool_input.get("query")
+        if isinstance(raw, str):
+            entry["query"] = raw
+        else:
+            # Fallback: serialize the entire tool_input as a JSON string
+            entry["query"] = json.dumps(tool_input, sort_keys=True, ensure_ascii=False)
+    elif tool_name == "WebFetch":
+        raw = tool_input.get("url")
+        if isinstance(raw, str):
+            entry["url"] = raw
+        else:
+            # Fallback: serialize the entire tool_input as a JSON string
+            entry["url"] = json.dumps(tool_input, sort_keys=True, ensure_ascii=False)
+
+    return entry
+
+
+def main(argv: list[str], *, payload: dict[str, Any] | None = None) -> int:
+    """Main entry point.
+
+    Args:
+        argv: Command-line arguments (argv[0] is the script name).
+        payload: If provided, use this dict directly instead of reading stdin.
+                 This path is used by tests.
+
+    Returns:
+        0 on success or silent skip, 1 on internal error.
+    """
+    if payload is None:
+        # CLI mode: read payload from stdin
+        try:
+            raw = sys.stdin.read()
+            payload = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as exc:
+            print(f"web-tool-log: malformed stdin: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"web-tool-log: failed to read stdin: {exc}", file=sys.stderr)
+            return 1
+
+    if not isinstance(payload, dict):
+        print("web-tool-log: stdin payload must be a JSON object", file=sys.stderr)
+        return 1
+
+    tool_name = _canonical_web_tool(payload.get("tool_name"))
+    if tool_name is None:
+        # Not a web tool — exit 0 silently (AC 1)
+        return 0
+
+    cwd_str = payload.get("cwd") or os.getcwd()
+    try:
+        cwd = Path(cwd_str).resolve()
+    except OSError:
+        return 0
+
+    task_dir = _resolve_task_dir(cwd, payload)
+    if task_dir is None or not task_dir.is_dir():
+        # No active task — exit 0 silently (AC 1)
+        return 0
+
+    tool_input = payload.get("tool_input") or {}
+    try:
+        entry = _build_entry(tool_name, tool_input)
+    except Exception as exc:
+        print(f"web-tool-log: failed to build entry: {exc}", file=sys.stderr)
+        return 1
+
+    log_path = task_dir / "web-tool-log.jsonl"
+    try:
+        _append_jsonl(log_path, entry)
+    except OSError as exc:
+        print(f"web-tool-log: failed to append {log_path}: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"web-tool-log: internal error: {exc}", file=sys.stderr)
+        sys.exit(1)
