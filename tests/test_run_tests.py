@@ -1,0 +1,269 @@
+"""`ctl run-tests`: test failures route to audit, never to REPAIR_PLANNING.
+
+TEST_EXECUTION -> REPAIR_PLANNING was a dead end for a failing suite: the
+repair log can only cite audit-report findings and none exist before the
+audit, so write-repair-log refused and only FAILED remained. run-tests now
+records the outcome, always advances to CHECKPOINT_AUDIT, the spec-completion
+auditor is handed the failure, and the DONE gate refuses until a re-run passes.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "hooks"))
+
+from lib_core import (  # noqa: E402
+    _compute_bypassed_gates_for_force,
+    _failing_test_results_err,
+    transition_task,
+)
+from router import _build_failing_tests_block  # noqa: E402
+from write_policy import _CONTROL_PLANE_EXACT  # noqa: E402
+from test_gate_checkpoint_audit_per_segment import (  # noqa: E402
+    _setup_task,
+    _write_exec_receipt,
+)
+from lib_receipts import receipt_executor_routing  # noqa: E402
+
+
+def _ready_task(tmp_path: Path, stage: str = "TEST_EXECUTION") -> Path:
+    td = _setup_task(tmp_path, stage)
+    receipt_executor_routing(td, [{"segment_id": "seg-1", "executor": "backend-executor"}])
+    _write_exec_receipt(td, "seg-1")
+    return td
+
+
+def _run_tests(td: Path, *commands: str) -> tuple[int, dict]:
+    argv = [sys.executable, str(ROOT / "hooks" / "ctl.py"), "run-tests", str(td)]
+    for command in commands:
+        argv += ["--command", command]
+    proc = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, check=False)
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        payload = {"stderr": proc.stderr}
+    return proc.returncode, payload
+
+
+def _stage(td: Path) -> str:
+    return json.loads((td / "manifest.json").read_text())["stage"]
+
+
+def test_failing_suite_advances_to_checkpoint_audit(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path)
+    code, payload = _run_tests(td, "exit 0", "echo conftest AttributeError; exit 3")
+
+    assert code == 0, payload
+    assert payload["status"] == "tests_failed"
+    assert payload["failed_commands"] == ["echo conftest AttributeError; exit 3"]
+    assert _stage(td) == "CHECKPOINT_AUDIT"
+
+    results = json.loads((td / "test-results.json").read_text())
+    assert results["status"] == "failed"
+    assert results["stage"] == "TEST_EXECUTION"
+    assert [r["exit_code"] for r in results["results"]] == [0, 3]
+    assert "conftest AttributeError" in results["results"][1]["stdout_tail"]
+    assert "[FAIL] tests" in (td / "execution-log.md").read_text()
+
+
+def test_passing_suite_advances_and_records_pass(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path)
+    code, payload = _run_tests(td, "true")
+
+    assert code == 0, payload
+    assert payload["status"] == "tests_passed"
+    assert _stage(td) == "CHECKPOINT_AUDIT"
+    assert json.loads((td / "test-results.json").read_text())["status"] == "passed"
+
+
+def test_rerun_after_repair_records_without_transition(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path, stage="CHECKPOINT_AUDIT")
+    _run_tests(td, "exit 1")
+    assert _failing_test_results_err(td) is not None
+
+    code, payload = _run_tests(td, "exit 0")
+    assert code == 0, payload
+    assert payload["stage"] == "CHECKPOINT_AUDIT"
+    assert payload["next_command"] is None
+    assert _failing_test_results_err(td) is None
+
+
+def test_refused_outside_test_stages(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path, stage="EXECUTION")
+    code, payload = _run_tests(td, "true")
+    assert code == 1
+    assert "unexpected stage for run-tests: EXECUTION" in payload["error"]
+    assert not (td / "test-results.json").exists()
+
+
+def test_test_execution_to_repair_planning_is_illegal(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path)
+    with pytest.raises(ValueError, match="Illegal stage transition"):
+        transition_task(td, "REPAIR_PLANNING")
+
+
+def test_done_gate_blocks_only_on_recorded_failure(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path, stage="CHECKPOINT_AUDIT")
+    assert _failing_test_results_err(td) is None  # never ran through ctl
+
+    def done_gaps() -> list[str]:
+        manifest = json.loads((td / "manifest.json").read_text())
+        return _compute_bypassed_gates_for_force(
+            task_dir=td, manifest=manifest,
+            current_stage="CHECKPOINT_AUDIT", next_stage="DONE",
+        )
+
+    (td / "test-results.json").write_text(json.dumps({"status": "failed"}))
+    assert any("test-results.json" in gap for gap in done_gaps())
+
+    (td / "test-results.json").write_text(json.dumps({"status": "passed"}))
+    assert not any("test-results.json" in gap for gap in done_gaps())
+
+
+def test_failing_tests_block_goes_to_spec_completion_only(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path, stage="CHECKPOINT_AUDIT")
+    assert _build_failing_tests_block(td, "spec-completion-auditor") == ""
+
+    _run_tests(td, "echo boom >&2; exit 2")
+    block = _build_failing_tests_block(td, "spec-completion-auditor")
+    assert "## Known Failing Tests" in block
+    assert "exit 2" in block and "boom" in block
+    assert _build_failing_tests_block(td, "security-auditor") == ""
+
+    _run_tests(td, "true")
+    assert _build_failing_tests_block(td, "spec-completion-auditor") == ""
+
+
+def test_test_results_is_control_plane() -> None:
+    assert "test-results.json" in _CONTROL_PLANE_EXACT
+
+
+def _write_policy(td: Path, policy: dict) -> None:
+    from lib_core import _persistent_project_dir
+
+    policy_dir = _persistent_project_dir(td.parent.parent)
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    (policy_dir / "policy.json").write_text(json.dumps(policy))
+
+
+FLAKY = "echo order-dependent failure; exit 1"
+
+
+def test_known_failure_from_policy_does_not_block(tmp_path: Path) -> None:
+    """Field report: a pre-existing, repo-wide flaky suite blocked DONE and ate
+    the task's repair budget. A policy known_test_failures entry waives it."""
+    td = _ready_task(tmp_path)
+    _write_policy(td, {"known_test_failures": [
+        {"command": FLAKY, "reason": "pre-existing order dependence, owner: db team", "expires": "2999-01-01"},
+    ]})
+    code, payload = _run_tests(td, "true", FLAKY)
+
+    assert code == 0, payload
+    assert payload["status"] == "tests_passed"
+    assert payload["failed_commands"] == []
+    assert payload["known_failures"] == [FLAKY]
+    results = json.loads((td / "test-results.json").read_text())
+    assert results["status"] == "passed_with_known_failures"
+    assert results["results"][1]["known_failure"]["reason"].startswith("pre-existing")
+    assert _failing_test_results_err(td) is None
+    assert _build_failing_tests_block(td, "spec-completion-auditor") == ""
+    assert "known failures" in (td / "execution-log.md").read_text()
+
+
+def test_known_failure_does_not_mask_other_failures(tmp_path: Path) -> None:
+    td = _ready_task(tmp_path)
+    _write_policy(td, {"known_test_failures": [{"command": FLAKY, "reason": "flaky"}]})
+    _, payload = _run_tests(td, FLAKY, "exit 2")
+
+    assert payload["status"] == "tests_failed"
+    assert payload["failed_commands"] == ["exit 2"]
+    assert json.loads((td / "test-results.json").read_text())["status"] == "failed"
+    assert _failing_test_results_err(td) is not None
+
+
+@pytest.mark.parametrize("entry", [
+    {"command": FLAKY, "reason": "flaky", "expires": "2000-01-01"},
+    {"command": FLAKY, "reason": ""},
+    {"command": FLAKY, "reason": "flaky", "expires": "not-a-date"},
+])
+def test_expired_or_unexplained_known_failure_still_blocks(tmp_path: Path, entry: dict) -> None:
+    td = _ready_task(tmp_path)
+    _write_policy(td, {"known_test_failures": [entry]})
+    _, payload = _run_tests(td, FLAKY)
+
+    assert payload["status"] == "tests_failed"
+    assert json.loads((td / "test-results.json").read_text())["status"] == "failed"
+    assert "[WARN] tests" in (td / "execution-log.md").read_text()
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", *args],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_pass_is_stale_once_the_code_changes(tmp_path: Path) -> None:
+    """A repair can break a test that passed before it. run-tests records a
+    fingerprint of the task's changed code; the DONE gate refuses a pass
+    whose code has changed since, whenever the change was made."""
+    td = _ready_task(tmp_path, stage="CHECKPOINT_AUDIT")
+    root = td.parent.parent
+    (root / ".gitignore").write_text(".dynos/\n")
+    (root / "app.py").write_text("def total():\n    return 1\n")
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "base")
+    manifest = json.loads((td / "manifest.json").read_text())
+    manifest["snapshot"] = {"head_sha": _git(root, "rev-parse", "HEAD")}
+    (td / "manifest.json").write_text(json.dumps(manifest))
+
+    (root / "app.py").write_text("def total():\n    return 2\n")  # the task's work
+    _run_tests(td, "true")
+    recorded = json.loads((td / "test-results.json").read_text())["code_fingerprint"]
+    assert isinstance(recorded, str) and len(recorded) == 64
+    assert _failing_test_results_err(td) is None
+
+    # Committing the work, or editing a doc, does not make the pass stale.
+    (root / "NOTES.md").write_text("notes\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "wip")
+    assert _failing_test_results_err(td) is None
+
+    # A later code edit does, with or without a repair log.
+    (root / "app.py").write_text("def total():\n    return 3\n")
+    err = _failing_test_results_err(td)
+    assert err is not None and "code changed after the last recorded test run" in err
+
+    _run_tests(td, "true")
+    assert _failing_test_results_err(td) is None
+    # A new untracked code file counts as a change too.
+    (root / "extra.py").write_text("def more():\n    return 0\n")
+    assert _failing_test_results_err(td) is not None
+
+
+def test_results_without_a_fingerprint_fall_back_to_the_repair_log_time(tmp_path: Path) -> None:
+    import os
+
+    td = _ready_task(tmp_path, stage="CHECKPOINT_AUDIT")
+    _run_tests(td, "true")
+    results = td / "test-results.json"
+    payload = json.loads(results.read_text())
+    payload.pop("code_fingerprint", None)  # as written before fingerprints existed
+    results.write_text(json.dumps(payload))
+    assert _failing_test_results_err(td) is None
+
+    repair_log = td / "repair-log.json"
+    repair_log.write_text(json.dumps({"repair_cycle": 1, "batches": []}))
+    later = results.stat().st_mtime_ns + 5_000_000_000
+    os.utime(repair_log, ns=(later, later))
+    assert "code changed after the last recorded test run" in (_failing_test_results_err(td) or "")
+    os.utime(results, ns=(later + 1, later + 1))
+    assert _failing_test_results_err(td) is None

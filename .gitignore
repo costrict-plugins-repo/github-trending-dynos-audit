@@ -1,0 +1,15 @@
+node_modules/
+cli/dist/
+hooks/dashboard-ui/src/**/*.js
+hooks/dashboard-ui/src/**/*.js.map
+.env
+*.log
+.dynos/
+__pycache__/
+*.pyc
+benchmarks/generated/
+
+# local work order, never committed
+plan.md
+run-plan.sh
+logs/
